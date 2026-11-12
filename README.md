@@ -1,10 +1,12 @@
 # TraceBit
 
+> TraceBit 受 Alma Recorder 的启发。
+
 一个独立、Windows 本地优先的行为记录与 AI 日报应用。
 
 当前版本已完全迁移到 **Rust + GPUI**：界面、采集、存储、AI 请求和系统集成都由 Rust 实现，不再需要 Node.js、Electron、WebView、HTML/CSS 或 PowerShell。
 
-TraceBit 参考 Alma 中 ActivityRecorder 的采集思路重新实现：按活动段记录前台应用、窗口标题、空闲/锁屏状态和去重后的屏幕快照；再把一天的记录整理成脱敏统计，让 AI 生成行为日报和具体省力建议。**不包含 Alma 的程序文件，也不依赖 Alma 运行。**
+TraceBit 按活动段记录前台应用、窗口标题、空闲/锁屏状态和去重后的屏幕快照，再把一天的记录整理成脱敏统计，让 AI 生成行为日报和具体省力建议。
 
 ## 功能
 
@@ -120,16 +122,3 @@ installer.nsi        # NSIS 安装包定义
 scripts/dist.cmd     # Release 与安装包构建
 scripts/smoke.cmd    # 单元测试与真实采集 smoke
 ```
-
-## 与 Alma 的关系和差异
-
-Alma 的安装包中，录制逻辑位于压缩后的 `alma-server/lib/server.mjs`，主要包括 `ActivityRecorder`、活动存储、活动分析和日报生成。TraceBit 抽取的是这些可独立理解的机制，并针对 Windows 做了轻量重实现。
-
-主要差异：
-
-- 使用 JSONL 而不是 Alma 的 SQLite，便于查看、备份和排障
-- Rust 后台线程直接调用 Win32，不启动轮询子进程
-- 不做 OCR、向量索引和键盘次数采集，降低依赖与隐私风险
-- AI 提示词专注于「一天的行为复盘 + 可执行省力建议」，不复用 Alma 的记忆库体系
-
-当前版本为 Windows 桌面版；macOS/Linux 采集端尚未实现。

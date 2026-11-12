@@ -30,14 +30,14 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
 };
 
-const CANVAS: u32 = 0xf4f2ed;
-const SURFACE: u32 = 0xfffefb;
-const SUBTLE: u32 = 0xebe8e1;
-const INK: u32 = 0x24231f;
-const SECONDARY: u32 = 0x6f6b62;
-const FAINT: u32 = 0x979186;
-const DIVIDER: u32 = 0xdedad1;
-const BRAND_PALE: u32 = 0xf4e7c8;
+const CANVAS: u32 = 0xf3f5f6;
+const SURFACE: u32 = 0xffffff;
+const SUBTLE: u32 = 0xe9edf0;
+const INK: u32 = 0x202428;
+const SECONDARY: u32 = 0x565e65;
+const FAINT: u32 = 0x747c83;
+const DIVIDER: u32 = 0xd7dde1;
+const BRAND_PALE: u32 = 0xf6ecd7;
 const GREEN: u32 = 0x2f7d57;
 const RED: u32 = 0xb64b4b;
 
@@ -559,7 +559,7 @@ impl TraceBitWindow {
                         div()
                             .text_xs()
                             .text_color(rgb(SECONDARY))
-                            .child("看见时间，少费点力"),
+                            .child("Windows 活动记录与日报"),
                     ),
             )
             .child(
@@ -714,8 +714,10 @@ impl TraceBitWindow {
                 .p_3()
                 .rounded_md()
                 .text_sm()
-                .bg(rgb(if *success { 0xe4efe7 } else { 0xf5e4e2 }))
-                .text_color(rgb(if *success { GREEN } else { RED }))
+                .bg(rgb(SURFACE))
+                .border_1()
+                .border_color(rgb(DIVIDER))
+                .text_color(rgb(if *success { INK } else { RED }))
                 .child(message.clone())
         })
     }
@@ -804,11 +806,10 @@ impl TraceBitWindow {
         };
         div()
             .flex()
-            .bg(rgb(SURFACE))
-            .border_1()
+            .w_full()
+            .py_4()
+            .border_b_1()
             .border_color(rgb(DIVIDER))
-            .rounded_lg()
-            .p_4()
             .child(metric(
                 "活跃时长",
                 &fmt_ms(self.day.total_active_ms),
@@ -859,7 +860,7 @@ impl TraceBitWindow {
             .and_then(|date| Local.from_local_datetime(&date).single())
             .map(|date| date.timestamp_millis())
         else {
-            return panel().child("时间线不可用");
+            return section().child("时间线不可用");
         };
         let day_end = day_start + 86_400_000;
         for stay in &self.day.stays {
@@ -888,7 +889,7 @@ impl TraceBitWindow {
                     .tooltip(move |_, cx| cx.new(|_| TextTooltip(tooltip.clone())).into()),
             );
         }
-        panel()
+        section()
             .gap_3()
             .child(panel_head(
                 "24 小时时间线",
@@ -920,7 +921,7 @@ impl TraceBitWindow {
             .max(1);
         let mut apps = self.day.apps.iter().collect::<Vec<_>>();
         apps.sort_by_key(|app| std::cmp::Reverse(app.ms));
-        panel()
+        section()
             .gap_3()
             .child(panel_head("应用使用", "按活跃时长排序"))
             .child(
@@ -1011,7 +1012,7 @@ impl TraceBitWindow {
         }
         let mut totals = totals.into_iter().collect::<Vec<_>>();
         totals.sort_by_key(|total| std::cmp::Reverse(total.1));
-        panel()
+        section()
             .gap_3()
             .child(panel_head("时间构成", ""))
             .children(totals.into_iter().map(|(category, ms)| {
@@ -1058,7 +1059,7 @@ impl TraceBitWindow {
 
     fn render_ai_card(&mut self, cx: &mut Context<Self>) -> Div {
         let configured = has_ai(&self.settings.get());
-        panel()
+        section()
             .gap_3()
             .child(panel_head(
                 "AI 行为日报",
@@ -1072,7 +1073,7 @@ impl TraceBitWindow {
                 if let Some(report) = &self.report {
                     report_excerpt(&report.markdown)
                 } else if configured {
-                    "把今天的记录整理成行为复盘和具体省力建议。".to_owned()
+                    "根据当天的应用使用和活跃时长生成日报。".to_owned()
                 } else {
                     "连接模型后即可生成日报。标题会脱敏，截图不会发送。".to_owned()
                 },
@@ -1103,7 +1104,7 @@ impl TraceBitWindow {
     }
 
     fn render_sites(&self) -> Div {
-        panel()
+        section()
             .gap_3()
             .child(panel_head("浏览网站", "仅记录当前浏览器域名，本机保存"))
             .children(if self.day.sites.is_empty() {
@@ -1156,7 +1157,7 @@ impl TraceBitWindow {
             .rev()
             .take(6)
             .collect::<Vec<_>>();
-        panel()
+        section()
             .gap_3()
             .child(panel_head("屏幕快照", "只保留画面有变化的帧"))
             .child(if shots.is_empty() {
@@ -1209,7 +1210,7 @@ impl TraceBitWindow {
             .gap_5()
             .child(self.render_page_head(
                 "AI 行为日报",
-                "看清时间去向，拿到今天就能用的省力建议",
+                "根据当天的应用使用、活跃时长和窗口标题生成",
                 true,
                 cx,
             ))
@@ -1263,7 +1264,9 @@ impl TraceBitWindow {
                 div()
                     .p_4()
                     .rounded_md()
-                    .bg(rgb(0xf5e4e2))
+                    .bg(rgb(CANVAS))
+                    .border_1()
+                    .border_color(rgb(DIVIDER))
                     .text_color(rgb(RED))
                     .child(error.clone()),
             );
@@ -1343,7 +1346,7 @@ impl TraceBitWindow {
             .w_full()
             .min_w(px(0.))
             .gap_5()
-            .child(self.render_page_head("设置", "采集、隐私、存储和模型都集中在这里", false, cx))
+            .child(self.render_page_head("设置", "修改后点击“保存设置”生效", false, cx))
             .children(self.render_notice());
         let recording = panel()
             .gap_4()
@@ -1836,6 +1839,10 @@ fn small_button(id: impl Into<ElementId>, label: &str, selected: bool) -> Statef
         .child(label.to_owned())
 }
 
+fn section() -> Div {
+    div().flex().flex_col().w_full().min_w(px(0.))
+}
+
 fn panel() -> Div {
     div()
         .flex()
@@ -1854,7 +1861,7 @@ fn panel_head(title: &str, hint: &str) -> Div {
         .items_center()
         .child(
             div()
-                .text_base()
+                .text_size(px(18.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(title.to_owned()),
         )
@@ -1873,8 +1880,6 @@ fn metric(label: &str, value: &str, note: &str) -> Div {
         .flex_1()
         .gap_1()
         .px_4()
-        .border_r_1()
-        .border_color(rgb(DIVIDER))
         .child(
             div()
                 .text_xs()
@@ -1925,11 +1930,11 @@ fn setting_row(name: &str, description: &str, control: impl IntoElement) -> Div 
 fn render_markdown_line(index: usize, line: &str) -> Stateful<Div> {
     let trimmed = line.trim();
     let (size, weight) = if trimmed.starts_with("# ") {
-        (22., FontWeight::BOLD)
+        (24., FontWeight::BOLD)
     } else if trimmed.starts_with("## ") {
         (18., FontWeight::SEMIBOLD)
     } else if trimmed.starts_with("### ") {
-        (15., FontWeight::SEMIBOLD)
+        (14., FontWeight::SEMIBOLD)
     } else {
         (14., FontWeight::NORMAL)
     };
