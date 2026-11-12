@@ -60,7 +60,10 @@ A quiet, light workbench for reviewing a day: warm paper canvas, ink text, one a
 - Respect `prefers-reduced-motion`.
 
 ## 9. Verification
-- Check 1240×840 and 960×620.
+- Check 1240×840 and 960×620 in the native GPUI window.
 - Check today with sparse data, empty day, recording active and paused.
 - Check report unconfigured, generating, generated and error states.
 - Check settings save and global toggle remain synchronized.
+- Check long window titles and long input values do not overflow their containers.
+- Check titlebar, taskbar and tray icons, plus close-to-tray restoration.
+- Run `cargo test` and `cargo run -- --native-smoke` after collector changes.

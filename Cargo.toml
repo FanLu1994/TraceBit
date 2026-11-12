@@ -1,0 +1,63 @@
+[package]
+name = "tracebit"
+version = "0.3.0"
+edition = "2024"
+description = "Windows 本地行为记录与 AI 日报"
+license = "MIT"
+default-run = "tracebit"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+image = { version = "0.24.9", default-features = false, features = ["jpeg", "png"] }
+open = "5.3"
+rand = "0.9"
+raw-window-handle = "0.6"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+screenshots = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+tray-icon = "0.21"
+unicode-segmentation = "1.12"
+url = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8"
+winreg = { version = "0.56", features = ["transactions"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Variant",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
