@@ -1,7 +1,8 @@
 use crate::{
+    categories::is_meeting,
     platform::{ForegroundSample, Sampler, workstation_is_locked},
     settings::Settings,
-    store::{DayStore, Event, local_date_key, now_ms},
+    store::{DayStore, Event, kinds, local_date_key, now_ms},
 };
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -30,6 +31,8 @@ const HIST_BINS: usize = 64;
 const HIST_CHANGE_THRESHOLD: f64 = 0.05;
 const PIXEL_DIFF_THRESHOLD: f64 = 0.02;
 const PIXEL_TOLERANCE: i16 = 30;
+/// Stored instead of the real title when a window matches a sensitive pattern.
+pub const SENSITIVE_TITLE: &str = "[敏感窗口]";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +221,7 @@ fn run_worker(
     let mut last_site_at = 0_i64;
     let mut was_locked = false;
     let mut was_idle = false;
+    let mut last_date = local_date_key(last_tick_at);
 
     let _ = rotate(&settings, &store);
     while !stop.load(Ordering::Acquire) {
@@ -226,19 +230,27 @@ fn run_worker(
             append_event(
                 &store,
                 &inner,
-                Event::at(last_loop_at, "suspend", json!({})),
+                Event::at(last_loop_at, kinds::SUSPEND, json!({})),
             );
-            append_event(&store, &inner, Event::at(now, "resume", json!({})));
+            append_event(&store, &inner, Event::at(now, kinds::RESUME, json!({})));
             dedup.clear();
             last_app.clear();
             last_title.clear();
         }
         last_loop_at = now;
+        // Each day file must name its foreground app; otherwise work that runs
+        // across midnight has no app until the next switch.
+        let today = local_date_key(now);
+        if today != last_date {
+            last_date = today;
+            last_app.clear();
+            last_title.clear();
+        }
 
         let locked = workstation_is_locked();
         if locked {
             if !was_locked {
-                append_event(&store, &inner, Event::at(now, "lock", json!({})));
+                append_event(&store, &inner, Event::at(now, kinds::LOCK, json!({})));
                 dedup.clear();
                 was_locked = true;
             }
@@ -247,7 +259,7 @@ fn run_worker(
             continue;
         }
         if was_locked {
-            append_event(&store, &inner, Event::at(now, "unlock", json!({})));
+            append_event(&store, &inner, Event::at(now, kinds::UNLOCK, json!({})));
             dedup.clear();
             was_locked = false;
             was_idle = false;
@@ -258,13 +270,28 @@ fn run_worker(
 
         let config = settings.get();
         let recording = config.recording;
-        let sample = sampler.sample(recording.browser_sites);
+        let mut sample = sampler.sample(recording.browser_sites);
+        let sensitive = is_sensitive(&sample, &config.privacy.sensitive_patterns);
+        if sensitive {
+            // Redact at the source: the real title never reaches disk.
+            sample.title = SENSITIVE_TITLE.to_owned();
+            sample.site.clear();
+        }
+        // Meetings, videos and slides are watched without touching input.
+        let passive = sample.fullscreen || is_meeting(&sample.name, &sample.app, &sample.title);
+        let idle_threshold = if passive {
+            recording
+                .passive_idle_threshold_ms
+                .max(recording.idle_threshold_ms)
+        } else {
+            recording.idle_threshold_ms
+        };
         // The process name and label are tracked independently; this also catches
         // two windows whose localized labels happen to be equal.
         let identity = format!("{}\n{}", sample.app, sample.name);
         let app_changed = identity != last_app;
         let title_changed = sample.title != last_title;
-        let idle = sample.idle_ms >= 0 && sample.idle_ms >= recording.idle_threshold_ms;
+        let idle = sample.idle_ms >= 0 && sample.idle_ms >= idle_threshold;
 
         update_state(&inner, false, idle, Some(sample.clone()));
         if app_changed
@@ -280,7 +307,8 @@ fn run_worker(
                     &sample.title,
                     sample.pid,
                     sample.idle_ms,
-                ),
+                )
+                .with_passive(passive),
             );
             last_focus_at = now;
             last_tick_at = now;
@@ -294,7 +322,7 @@ fn run_worker(
                 append_event(
                     &store,
                     &inner,
-                    Event::at(now, "tick", json!({"i": sample.idle_ms})),
+                    Event::at(now, kinds::TICK, json!({"i": sample.idle_ms})).with_passive(passive),
                 );
             }
             if was_idle && !idle && recording.screenshots {
@@ -304,10 +332,7 @@ fn run_worker(
         }
         was_idle = idle;
 
-        if recording.browser_sites
-            && !idle
-            && !is_sensitive(&sample, &config.privacy.sensitive_patterns)
-        {
+        if recording.browser_sites && !idle && !sensitive {
             let site = normalize_site_host(&sample.site);
             let key = format!(
                 "{}\n{site}",
@@ -323,7 +348,7 @@ fn run_worker(
                     &inner,
                     Event::at(
                         now,
-                        "site_visit",
+                        kinds::SITE_VISIT,
                         json!({"site":site, "app":sample.app, "name":sample.name, "pid":sample.pid, "i":sample.idle_ms}),
                     ),
                 );
@@ -335,6 +360,7 @@ fn run_worker(
         if capture_at.is_some_and(|scheduled| scheduled <= now) {
             capture_at = None;
             if !idle
+                && !sensitive
                 && recording.screenshots
                 && let Err(error) = capture("app_focus", &settings, &store, &sample, &mut dedup)
             {
@@ -344,6 +370,7 @@ fn run_worker(
         if now - last_heartbeat_at >= recording.heartbeat_ms.max(60_000) as i64 {
             last_heartbeat_at = now;
             if !idle
+                && !sensitive
                 && recording.screenshots
                 && let Err(error) = capture("heartbeat", &settings, &store, &sample, &mut dedup)
             {
@@ -387,7 +414,10 @@ fn rotate(settings: &Settings, store: &DayStore) -> Result<()> {
 }
 
 fn is_sensitive(sample: &ForegroundSample, patterns: &[String]) -> bool {
-    let haystack = format!("{}\n{}", sample.app, sample.title).to_lowercase();
+    if sample.title == SENSITIVE_TITLE {
+        return true;
+    }
+    let haystack = format!("{}\n{}\n{}", sample.app, sample.title, sample.site).to_lowercase();
     patterns.iter().any(|pattern| {
         let pattern = pattern.trim().to_lowercase();
         !pattern.is_empty() && haystack.contains(&pattern)
@@ -406,11 +436,19 @@ fn capture(
         return Ok(None);
     }
     let screens = screenshots::Screen::all().context("无法枚举显示器")?;
-    let screen = screens
-        .iter()
-        .find(|screen| screen.display_info.is_primary)
-        .or_else(|| screens.first())
-        .context("找不到主显示器")?;
+    // Capture the monitor that shows the foreground window, not always the
+    // primary one; otherwise a window on a second screen yields an unrelated frame.
+    let screen = sample
+        .center
+        .and_then(|(x, y)| screenshots::Screen::from_point(x, y).ok())
+        .or_else(|| {
+            screens
+                .iter()
+                .find(|screen| screen.display_info.is_primary)
+                .or_else(|| screens.first())
+                .copied()
+        })
+        .context("找不到显示器")?;
     let captured = screen.capture().context("无法截取主显示器")?;
     let (changed, diff) = dedup.changed(&captured);
     if !changed {
@@ -446,7 +484,7 @@ fn capture(
     let relative = PathBuf::from("snapshots").join(&date_key).join(&name);
     store.append(Event::at(
         now,
-        "screenshot",
+        kinds::SCREENSHOT,
         json!({
             "file": relative.to_string_lossy(),
             "w": width,

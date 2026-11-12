@@ -2,7 +2,7 @@
 SetCompressor /SOLID lzma
 
 !define APP_NAME "TraceBit"
-!define APP_VERSION "0.3.0"
+!define APP_VERSION "0.4.0"
 !define APP_EXE "tracebit.exe"
 !define APP_ID "TraceBit.Desktop"
 
@@ -21,7 +21,7 @@ VIProductVersion "${APP_VERSION}.0"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"
-VIAddVersionKey "FileDescription" "本地行为记录与 AI 日报"
+VIAddVersionKey "FileDescription" "本地行为记录与 AI 效率建议"
 VIAddVersionKey "LegalCopyright" "TraceBit"
 
 !insertmacro MUI_PAGE_DIRECTORY

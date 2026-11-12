@@ -1,7 +1,9 @@
 use crate::{
-    analyzer::chat_completion,
-    settings::{Settings, SettingsData},
-    store::{DayStore, DeriveOptions, Snapshot, hhmm, local_date_key, now_ms, validate_date_key},
+    llm::{self, ChatOptions},
+    recorder::SENSITIVE_TITLE,
+    redact::{ai_title, redact_text},
+    settings::{AiSettings, Endpoint, Settings},
+    store::{DayStore, Snapshot, hhmm, local_date_key, now_ms, validate_date_key},
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -18,14 +20,15 @@ use std::{
 
 const MAX_SCREENSHOTS: usize = 6;
 const MAX_IMAGE_EDGE: u32 = 1024;
-const SUMMARY_SYSTEM_PROMPT: &str = r#"你是屏幕活动摘要助手。根据用户主动提供的一段时间内的屏幕截图，概括用户实际做了什么。
+const SUMMARY_SYSTEM_PROMPT: &str = r#"你是屏幕活动摘要助手。根据一段时间内按时间顺序给出的屏幕截图（每张附带当时的前台应用和窗口标题），概括用户实际在做什么。
 
 规则：
 - 使用简体中文，输出 2-4 句、约 80-180 字的纯文本，不要标题或 Markdown。
-- 按截图的时间顺序总结主要活动，只描述画面中能够确认的事实。
-- 看不清或无法确认的内容不要猜测，可以说明“部分画面无法确认”。
-- 不要复述密码、密钥、银行卡号、私人聊天原文等敏感内容；只需概括活动类型。
-- 不评价效率，不提供建议，不补充截图之外的信息。"#;
+- 说清楚任务本身（例如“在调试某个模块的登录接口”“在整理季度报表”），而不只是应用名。
+- 如果能看出卡点、等待、重复操作或频繁中断，简要指出，这对后续的效率建议最有价值。
+- 只描述画面中能确认的事实；看不清的不要猜，可以说“部分画面无法确认”。
+- 不要复述密码、密钥、银行卡号、私人聊天原文、人名等敏感内容；只概括活动类型。
+- 不评价效率，不提供建议。"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -38,10 +41,82 @@ pub struct IntervalSummary {
     pub screenshot_count: usize,
 }
 
+/// What was sent in the latest screenshot request, kept for transparency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SentRequest {
+    pub at: i64,
+    pub endpoint: String,
+    pub model: String,
+    pub prompt: String,
+    pub files: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AnalysisCursor {
     last_end: i64,
+}
+
+pub fn read_summaries(directory: &Path, date_key: &str) -> Vec<IntervalSummary> {
+    if validate_date_key(date_key).is_err() {
+        return Vec::new();
+    }
+    let mut summaries = fs::read_to_string(directory.join(format!("{date_key}.jsonl")))
+        .ok()
+        .into_iter()
+        .flat_map(|raw| raw.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|line| serde_json::from_str::<IntervalSummary>(&line).ok())
+        .collect::<Vec<_>>();
+    summaries.sort_by_key(|summary| summary.start);
+    summaries
+}
+
+/// Screenshot analysis uses the same endpoint and model as the advice; the
+/// configured model must accept image input (a multimodal model).
+pub fn vision_endpoint(ai: &AiSettings) -> Result<Endpoint> {
+    let endpoint = ai.text_endpoint();
+    if !endpoint.configured() {
+        bail!("请先在设置中配置支持图片输入的多模态模型，例如 qwen2.5vl、gpt-4o-mini");
+    }
+    Ok(endpoint)
+}
+
+/// Sends a tiny generated image to verify the vision endpoint reads images.
+pub fn test_vision(ai: &AiSettings) -> Result<String> {
+    let endpoint = vision_endpoint(ai)?;
+    let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        64,
+        64,
+        image::Rgba([200, 30, 30, 255]),
+    ));
+    let output = llm::chat(
+        &endpoint,
+        json!([{"role":"user", "content":[
+            {"type":"text", "text":"这张图片主要是什么颜色？只回答颜色。"},
+            {"type":"image_url", "image_url":{"url": encode_jpeg(&image)?}}
+        ]}]),
+        ChatOptions {
+            max_tokens: 16,
+            timeout_ms: 60_000,
+            ..Default::default()
+        },
+    )
+    .context("视觉模型测试失败（模型可能不支持图片输入）")?;
+    Ok(output.model)
+}
+
+/// Clock-aligned window end at or before `now` (e.g. :00 and :30 for 30 minutes),
+/// counted from local midnight.
+fn aligned_end(now: i64, interval: i64) -> i64 {
+    let midnight = Local
+        .timestamp_millis_opt(now)
+        .single()
+        .and_then(|date| date.date_naive().and_hms_opt(0, 0, 0))
+        .and_then(|date| Local.from_local_datetime(&date).earliest())
+        .map(|date| date.timestamp_millis())
+        .unwrap_or(now - now.rem_euclid(interval));
+    midnight + (now - midnight) / interval * interval
 }
 
 #[derive(Debug)]
@@ -61,18 +136,18 @@ impl IntervalAnalyzer {
         })
     }
 
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     pub fn list(&self, date_key: &str) -> Vec<IntervalSummary> {
-        let Ok(path) = self.summary_file(date_key) else {
-            return Vec::new();
-        };
-        let mut summaries = fs::read_to_string(path)
+        read_summaries(&self.directory, date_key)
+    }
+
+    pub fn last_request(&self) -> Option<SentRequest> {
+        fs::read_to_string(self.directory.join("last_request.json"))
             .ok()
-            .into_iter()
-            .flat_map(|raw| raw.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter_map(|line| serde_json::from_str::<IntervalSummary>(&line).ok())
-            .collect::<Vec<_>>();
-        summaries.sort_by_key(|summary| summary.start);
-        summaries
+            .and_then(|raw| serde_json::from_str(&raw).ok())
     }
 
     pub fn purge_all(&self) -> Result<()> {
@@ -83,8 +158,9 @@ impl IntervalAnalyzer {
         Ok(())
     }
 
-    /// Analyze one completed interval. The first call establishes a cursor so enabling
-    /// the feature never uploads a backlog of historical screenshots.
+    /// Analyze one completed, clock-aligned interval. The first call establishes a
+    /// cursor so enabling the feature never uploads a backlog of old screenshots;
+    /// after downtime only the latest complete interval is analyzed.
     pub fn analyze_due(&self, now: i64) -> Result<Option<IntervalSummary>> {
         let config = self.settings.get();
         if !config.ai.screenshot_analysis {
@@ -92,23 +168,17 @@ impl IntervalAnalyzer {
         }
         let interval =
             (config.ai.screenshot_analysis_interval_ms as i64).clamp(300_000, 14_400_000);
+        let end = aligned_end(now, interval);
         let previous = self.cursor()?.last_end;
         if previous <= 0 {
-            self.save_cursor(now)?;
+            self.save_cursor(end)?;
             return Ok(None);
         }
-        if previous + interval > now {
+        if end <= previous {
             return Ok(None);
         }
-        // After downtime or a long disabled period, only analyze the latest complete
-        // interval instead of uploading every old screenshot.
-        let end = if now - previous > interval * 2 {
-            now
-        } else {
-            previous + interval
-        };
-        let start = end - interval;
-        let snapshots = self.snapshots_between(start, end, &config)?;
+        let start = previous.max(end - interval);
+        let snapshots = self.snapshots_between(start, end)?;
         if snapshots.is_empty() {
             self.save_cursor(end)?;
             return Ok(None);
@@ -128,62 +198,102 @@ impl IntervalAnalyzer {
             bail!("该时段没有可分析的截图");
         }
         let ai = self.settings.get().ai;
-        let timeline = snapshots
-            .iter()
-            .enumerate()
-            .map(|(index, shot)| format!("第 {} 张：{}", index + 1, hhmm(shot.ts)))
-            .collect::<Vec<_>>()
-            .join("；");
-        let prompt = format!(
-            "请分析 {} 到 {} 这一时段的屏幕截图，总结用户做了什么。{}。",
+        let endpoint = vision_endpoint(&ai)?;
+        let previous = self
+            .list(&local_date_key(start))
+            .into_iter()
+            .rev()
+            .find(|summary| summary.end <= start && start - summary.end <= 4 * 3_600_000);
+        let mut prompt = format!(
+            "请总结 {} 到 {} 这一时段用户在做什么。",
             hhmm(start),
-            hhmm(end),
-            timeline
+            hhmm(end)
         );
+        if let Some(previous) = &previous {
+            prompt.push_str(&format!(
+                "上一时段（{}–{}）的摘要供衔接参考：{}",
+                hhmm(previous.start),
+                hhmm(previous.end),
+                redact_text(&previous.summary)
+            ));
+        }
         let mut content = vec![json!({"type":"text", "text":prompt})];
-        let mut screenshot_count = 0;
-        for shot in &snapshots {
+        let mut files = Vec::new();
+        for (index, shot) in snapshots.iter().enumerate() {
+            if shot.title.as_deref() == Some(SENSITIVE_TITLE) {
+                continue;
+            }
             let Some(path) = self.store.snapshot_path(&shot.file) else {
                 continue;
             };
             match snapshot_data_url(&path) {
                 Ok(url) => {
+                    let app = shot.app.clone().unwrap_or_default();
+                    let category = crate::categories::categorize("", &app, "");
+                    let title = shot
+                        .title
+                        .as_deref()
+                        .map(|title| ai_title(category, title))
+                        .unwrap_or_default();
+                    content.push(json!({"type":"text", "text": format!(
+                        "第 {} 张，{}，前台：{} {}",
+                        index + 1,
+                        hhmm(shot.ts),
+                        redact_text(&app),
+                        title
+                    )}));
                     content.push(json!({"type":"image_url", "image_url":{"url":url}}));
-                    screenshot_count += 1;
+                    files.push(shot.file.clone());
                 }
                 Err(error) => eprintln!("[IntervalAnalysis] 跳过无法读取的截图：{error:#}"),
             }
         }
-        if screenshot_count == 0 {
+        if files.is_empty() {
             bail!("该时段的截图均无法读取");
         }
-        let (summary, model) = chat_completion(
-            &ai,
+        let text_parts = content
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.record_request(&SentRequest {
+            at: now_ms(),
+            endpoint: endpoint.base_url.clone(),
+            model: endpoint.model.clone(),
+            prompt: text_parts,
+            files: files.clone(),
+        });
+        let output = llm::chat(
+            &endpoint,
             json!([
                 {"role":"system", "content":SUMMARY_SYSTEM_PROMPT},
                 {"role":"user", "content":Value::Array(content)}
             ]),
-            400,
-            120_000,
+            ChatOptions {
+                max_tokens: 600,
+                timeout_ms: 120_000,
+                ..Default::default()
+            },
         )?;
         let summary = IntervalSummary {
             start,
             end,
             created_at: now_ms(),
-            model,
-            summary,
-            screenshot_count,
+            model: output.model,
+            summary: output.content,
+            screenshot_count: files.len(),
         };
         self.append(&summary)?;
         Ok(summary)
     }
 
-    fn snapshots_between(
-        &self,
-        start: i64,
-        end: i64,
-        config: &SettingsData,
-    ) -> Result<Vec<Snapshot>> {
+    fn record_request(&self, request: &SentRequest) {
+        if let Ok(json) = serde_json::to_vec_pretty(request) {
+            let _ = fs::write(self.directory.join("last_request.json"), json);
+        }
+    }
+
+    fn snapshots_between(&self, start: i64, end: i64) -> Result<Vec<Snapshot>> {
         let start_date = Local
             .timestamp_millis_opt(start)
             .single()
@@ -194,19 +304,12 @@ impl IntervalAnalyzer {
             .single()
             .context("分析结束时间无效")?
             .date_naive();
-        let options = DeriveOptions {
-            idle_threshold_ms: config.recording.idle_threshold_ms,
-            session_gap_ms: config.recording.session_gap_ms,
-        };
         let mut snapshots = Vec::new();
         let mut date = start_date;
         while date <= end_date {
-            let stats = self
-                .store
-                .day_stats(&date.format("%Y-%m-%d").to_string(), options)?;
             snapshots.extend(
-                stats
-                    .screenshots
+                self.store
+                    .screenshots(&date.format("%Y-%m-%d").to_string())?
                     .into_iter()
                     .filter(|shot| shot.ts > start && shot.ts <= end),
             );
@@ -222,7 +325,9 @@ impl IntervalAnalyzer {
     }
 
     fn append(&self, summary: &IntervalSummary) -> Result<()> {
-        let path = self.summary_file(&local_date_key(summary.end))?;
+        // Filed under the day the interval started, so a summary of 23:30–00:00
+        // belongs to the day it describes.
+        let path = self.summary_file(&local_date_key(summary.start))?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         serde_json::to_writer(&mut file, summary)?;
         file.write_all(b"\n")?;
@@ -291,6 +396,7 @@ fn encode_jpeg(image: &DynamicImage) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::mock;
     use image::{ImageBuffer, Rgba};
 
     #[test]
@@ -330,57 +436,40 @@ mod tests {
     }
 
     #[test]
-    fn interval_analysis_sends_images_and_persists_summary() {
-        use std::{io::Read, net::TcpListener, sync::mpsc, thread, time::Duration};
+    fn windows_align_to_the_clock() {
+        let date = Local::now().date_naive();
+        let ts = |h, m| {
+            Local
+                .from_local_datetime(&date.and_hms_opt(h, m, 0).unwrap())
+                .single()
+                .unwrap()
+                .timestamp_millis()
+        };
+        assert_eq!(aligned_end(ts(10, 47), 30 * 60_000), ts(10, 30));
+        assert_eq!(aligned_end(ts(10, 30), 30 * 60_000), ts(10, 30));
+    }
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut raw = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            let expected = loop {
-                let count = socket.read(&mut buffer).unwrap();
-                if count == 0 {
-                    break None;
-                }
-                raw.extend_from_slice(&buffer[..count]);
-                if let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&raw[..header_end]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if raw.len() >= header_end + 4 + length {
-                        break Some(header_end + 4 + length);
-                    }
-                }
-            };
-            if let Some(expected) = expected {
-                tx.send(String::from_utf8_lossy(&raw[..expected]).into_owned())
-                    .unwrap();
-            }
-            let body = json!({
-                "model":"vision-mock",
-                "choices":[{"message":{"content":"先处理项目代码，随后查看文档并整理记录。"}}]
-            })
-            .to_string();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-        });
+    #[test]
+    fn screenshot_analysis_uses_the_main_multimodal_model() {
+        let mut ai = AiSettings::default();
+        assert!(vision_endpoint(&ai).is_err());
+        ai.base_url = "https://api.openai.com/v1".to_owned();
+        ai.model = "gpt-4o-mini".to_owned();
+        let endpoint = vision_endpoint(&ai).unwrap();
+        assert_eq!(endpoint.model, "gpt-4o-mini");
+        assert_eq!(endpoint.base_url, "https://api.openai.com/v1");
+    }
 
+    #[test]
+    fn interval_analysis_sends_images_with_context_and_persists_summary() {
+        let (url, rx) = mock::serve(vec![mock::completion(
+            "vision-mock",
+            "先处理项目代码，随后查看文档并整理记录。",
+        )]);
         let temp = tempfile::tempdir().unwrap();
         let settings = Arc::new(Settings::load(temp.path().join("user")));
         settings
-            .patch(&json!({"ai":{
-                "baseUrl":format!("http://{address}/v1"),
-                "model":"vision-mock"
-            }}))
+            .patch(&json!({"ai":{"baseUrl":url, "apiKey":"vision-key", "model":"vision-mock"}}))
             .unwrap();
         let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
         let date = Local::now().date_naive();
@@ -404,20 +493,24 @@ mod tests {
             bytes: 1,
             trigger: "heartbeat".to_owned(),
             diff: None,
-            app: None,
-            title: None,
+            app: Some("微信".to_owned()),
+            title: Some("张三".to_owned()),
         };
         let analyzer =
             IntervalAnalyzer::new(settings, store, temp.path().join("intervals")).unwrap();
         let summary = analyzer
             .analyze_interval(start, end, vec![snapshot])
             .unwrap();
-        let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let request = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert!(request.contains("image_url"));
         assert!(request.contains("data:image/jpeg;base64,"));
         assert!(request.contains("屏幕活动摘要助手"));
+        assert!(request.contains("vision-mock"));
+        assert!(request.contains("Bearer vision-key"));
+        assert!(!request.contains("张三"));
         assert_eq!(summary.screenshot_count, 1);
         assert_eq!(summary.model, "vision-mock");
         assert_eq!(analyzer.list(&date_key), vec![summary]);
+        assert_eq!(analyzer.last_request().unwrap().files.len(), 1);
     }
 }

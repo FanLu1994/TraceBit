@@ -1,15 +1,211 @@
-pub const CATEGORIES: [&str; 10] = [
+pub const CATEGORIES: [&str; 11] = [
     "开发",
     "浏览器",
     "即时通讯",
     "办公文档",
     "会议",
     "设计",
+    "资讯社交",
     "娱乐",
     "工具",
     "系统",
     "其他",
 ];
+
+/// Categories that represent producing work rather than consuming or coordinating.
+pub fn is_productive(category: &str) -> bool {
+    matches!(category, "开发" | "办公文档" | "设计")
+}
+
+pub fn is_communication(category: &str) -> bool {
+    category == "即时通讯"
+}
+
+pub fn is_distraction(category: &str) -> bool {
+    matches!(category, "娱乐" | "资讯社交")
+}
+
+pub fn is_browser_process(proc_name: &str) -> bool {
+    proc_category(&normalize_proc(proc_name)) == Some("浏览器")
+}
+
+/// Maps a browser host to a work category so browser time is not one opaque bucket.
+/// Matching is on the registrable suffix, so `docs.github.com` matches `github.com`.
+pub fn site_category(host: &str) -> Option<&'static str> {
+    let host = host.trim().trim_end_matches('.').to_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    if host == "localhost"
+        || host.starts_with("127.")
+        || host.starts_with("192.168.")
+        || host.starts_with("10.")
+    {
+        return Some("开发");
+    }
+    let groups: [(&[&str], &str); 8] = [
+        (
+            &[
+                "chatgpt.com",
+                "openai.com",
+                "claude.ai",
+                "gemini.google.com",
+                "kimi.com",
+                "kimi.moonshot.cn",
+                "chat.deepseek.com",
+                "doubao.com",
+                "tongyi.aliyun.com",
+                "yiyan.baidu.com",
+                "perplexity.ai",
+                "poe.com",
+            ],
+            "工具",
+        ),
+        (
+            &[
+                "github.com",
+                "gitlab.com",
+                "gitee.com",
+                "bitbucket.org",
+                "stackoverflow.com",
+                "stackexchange.com",
+                "docs.rs",
+                "crates.io",
+                "npmjs.com",
+                "pypi.org",
+                "developer.mozilla.org",
+                "rust-lang.org",
+                "python.org",
+                "go.dev",
+                "learn.microsoft.com",
+                "vercel.com",
+                "netlify.app",
+                "cloudflare.com",
+                "aws.amazon.com",
+                "console.cloud.google.com",
+                "aliyun.com",
+                "huggingface.co",
+                "csdn.net",
+                "juejin.cn",
+                "cnblogs.com",
+                "segmentfault.com",
+                "v2ex.com",
+            ],
+            "开发",
+        ),
+        (
+            &[
+                "docs.google.com",
+                "notion.so",
+                "notion.site",
+                "yuque.com",
+                "feishu.cn",
+                "larksuite.com",
+                "office.com",
+                "sharepoint.com",
+                "kdocs.cn",
+                "docs.qq.com",
+                "shimo.im",
+                "confluence",
+                "atlassian.net",
+                "wps.cn",
+                "overleaf.com",
+            ],
+            "办公文档",
+        ),
+        (
+            &[
+                "meet.google.com",
+                "zoom.us",
+                "meeting.tencent.com",
+                "teams.microsoft.com",
+                "webex.com",
+            ],
+            "会议",
+        ),
+        (
+            &[
+                "mail.google.com",
+                "outlook.live.com",
+                "outlook.office.com",
+                "mail.qq.com",
+                "mail.163.com",
+                "web.whatsapp.com",
+                "web.telegram.org",
+                "slack.com",
+                "discord.com",
+                "wx.qq.com",
+            ],
+            "即时通讯",
+        ),
+        (
+            &[
+                "figma.com",
+                "canva.com",
+                "mastergo.com",
+                "js.design",
+                "dribbble.com",
+                "behance.net",
+            ],
+            "设计",
+        ),
+        (
+            &[
+                "bilibili.com",
+                "youtube.com",
+                "youku.com",
+                "iqiyi.com",
+                "v.qq.com",
+                "netflix.com",
+                "twitch.tv",
+                "douyin.com",
+                "huya.com",
+                "douyu.com",
+                "music.163.com",
+                "spotify.com",
+                "mgtv.com",
+                "taobao.com",
+                "jd.com",
+                "tmall.com",
+                "pinduoduo.com",
+                "steampowered.com",
+            ],
+            "娱乐",
+        ),
+        (
+            &[
+                "weibo.com",
+                "zhihu.com",
+                "x.com",
+                "twitter.com",
+                "reddit.com",
+                "douban.com",
+                "xiaohongshu.com",
+                "facebook.com",
+                "instagram.com",
+                "news.ycombinator.com",
+                "36kr.com",
+                "toutiao.com",
+                "sina.com.cn",
+                "163.com",
+                "qq.com",
+            ],
+            "资讯社交",
+        ),
+    ];
+    groups.into_iter().find_map(|(suffixes, category)| {
+        suffixes
+            .iter()
+            .any(|suffix| {
+                if suffix.contains('.') {
+                    host == *suffix || host.ends_with(&format!(".{suffix}"))
+                } else {
+                    host.contains(suffix)
+                }
+            })
+            .then_some(category)
+    })
+}
 
 pub fn normalize_proc(name: &str) -> String {
     name.trim()
@@ -197,6 +393,10 @@ pub fn categorize(proc_name: &str, app_label: &str, title: &str) -> &'static str
     if let Some(category) = proc_category(&proc) {
         return category;
     }
+    // Unreal Engine games ship as "<Name>-Win64-Shipping.exe".
+    if proc.ends_with("-shipping") {
+        return "娱乐";
+    }
     let haystack = format!("{app_label} {title}").to_lowercase();
     if contains_any(&haystack, &TITLE_MEETING_PATTERNS)
         && matches!(
@@ -257,5 +457,16 @@ mod tests {
         );
         assert_eq!(categorize("unknown", "", "notes.docx"), "办公文档");
         assert!(is_meeting("chrome", "Chrome", "Weekly Meeting"));
+    }
+
+    #[test]
+    fn sites_map_by_suffix_not_substring() {
+        assert_eq!(site_category("docs.github.com"), Some("开发"));
+        assert_eq!(site_category("www.bilibili.com"), Some("娱乐"));
+        assert_eq!(site_category("mail.qq.com"), Some("即时通讯"));
+        assert_eq!(site_category("notgithub.com"), None);
+        assert_eq!(site_category("localhost"), Some("开发"));
+        assert!(is_browser_process("msedge.exe"));
+        assert_eq!(categorize("X6Game-Win64-Shipping", "", ""), "娱乐");
     }
 }

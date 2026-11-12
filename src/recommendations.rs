@@ -1,6 +1,6 @@
 use crate::{
     categories::{is_meeting, normalize_proc},
-    store::{AppStat, DayStats, Stay, local_datetime},
+    store::{AppStat, DayStats, Stay},
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -427,52 +427,6 @@ pub fn build_recommendations(stats: &DayStats) -> Vec<Recommendation> {
     opportunities
 }
 
-pub fn recommendations_markdown(
-    recommendations: &[Recommendation],
-    search: &SearchSummary,
-) -> String {
-    if recommendations.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["## 六、可工具化的操作".to_owned(), String::new()];
-    if search.enabled {
-        lines.push(format!("> 本地规则结合联网检索：执行 {} 次抽象关键词查询，新增 {} 个待审核候选，验证 {} 个来源链接。搜索服务不会收到窗口标题、网站域名或行为统计。", search.queries, search.added, search.verified));
-    } else {
-        lines.push("> 以下来自本地行为规则和内置精选资源，未进行联网搜索。".to_owned());
-    }
-    if let Some(error) = search.errors.first() {
-        lines.push(format!("> 联网检索提示：{error}。已保留本地精选结果。"));
-    }
-    lines.push(String::new());
-    for opportunity in recommendations {
-        lines.push(format!("### {}", opportunity.title));
-        lines.push(format!("- 操作依据：{}", opportunity.evidence));
-        lines.push(format!("- 优化方向：{}", opportunity.summary));
-        for resource in &opportunity.resources {
-            let checked = resource
-                .verified_at
-                .and_then(local_datetime)
-                .map(|date| format!("，检查于 {}", date.format("%Y-%m-%d %H:%M:%S")))
-                .unwrap_or_default();
-            lines.push(format!(
-                "- [{}]({})（{}）：{} 预期收益：{} 配置成本：{} 权限与隐私：{} 来源状态：{}{}。",
-                resource.name,
-                resource.url,
-                resource.kind,
-                resource.description,
-                resource.benefit,
-                resource.setup_cost,
-                resource.permissions,
-                resource.verification,
-                checked
-            ));
-        }
-        lines.push(String::new());
-    }
-    lines.push("以上资源只供人工评估，TraceBit 不会自动下载、安装或启用。".to_owned());
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +441,7 @@ mod tests {
             title: title.to_owned(),
             titles: BTreeSet::from([title.to_owned()]),
             pid: 1,
+            ..Default::default()
         }
     }
 
@@ -509,6 +464,7 @@ mod tests {
             longest_idle_ms: 0,
             longest_block: None,
             snapshot_bytes: 0,
+            ..Default::default()
         }
     }
 
@@ -536,6 +492,7 @@ mod tests {
             ms: 1,
             switches: 0,
             titles: BTreeMap::from([("secret@example.com git commit".to_owned(), 3)]),
+            title_ms: BTreeMap::new(),
         }];
         let recommendations = build_recommendations(&stats(stays, apps));
         assert!(
@@ -562,8 +519,5 @@ mod tests {
                         && !resource.permissions.is_empty())
             );
         }
-        let markdown = recommendations_markdown(&recommendations, &SearchSummary::default());
-        assert!(markdown.contains("## 六、可工具化的操作"));
-        assert!(!markdown.contains("secret@example.com"));
     }
 }

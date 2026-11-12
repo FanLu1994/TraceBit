@@ -1,7 +1,7 @@
 use crate::{
     analyzer::{Analyzer, Report, ReportSummary},
     input::{self, TextInput},
-    intervals::{IntervalAnalyzer, IntervalSummary},
+    intervals::{IntervalAnalyzer, IntervalSummary, SentRequest},
     platform,
     recorder::{Recorder, RecorderStatus},
     settings::{Settings, SettingsData},
@@ -79,6 +79,7 @@ struct FormState {
     search_key: Entity<TextInput>,
     heartbeat: Entity<TextInput>,
     idle: Entity<TextInput>,
+    passive_idle: Entity<TextInput>,
     patterns: Entity<TextInput>,
     cap: Entity<TextInput>,
     retention: Entity<TextInput>,
@@ -127,6 +128,12 @@ impl FormState {
                 cx,
                 (settings.recording.idle_threshold_ms / 60_000).to_string(),
                 "1",
+                false,
+            ),
+            passive_idle: input(
+                cx,
+                (settings.recording.passive_idle_threshold_ms / 60_000).to_string(),
+                "15",
                 false,
             ),
             patterns: input(
@@ -179,6 +186,11 @@ impl FormState {
             .unwrap_or(1.0)
             .clamp(1.0, 30.0)
             * 60_000.0) as i64;
+        draft.recording.passive_idle_threshold_ms = (value(&self.passive_idle)
+            .parse::<f64>()
+            .unwrap_or(15.0)
+            .clamp(1.0, 120.0)
+            * 60_000.0) as i64;
         draft.privacy.sensitive_patterns = value(&self.patterns)
             .split([',', '，', '\n'])
             .map(str::trim)
@@ -211,6 +223,7 @@ pub struct TraceBitWindow {
     report_list: Vec<ReportSummary>,
     interval_summaries: Vec<IntervalSummary>,
     interval_error: Option<String>,
+    interval_request: Option<SentRequest>,
     status: RecorderStatus,
     draft: SettingsData,
     form: FormState,
@@ -218,7 +231,10 @@ pub struct TraceBitWindow {
     testing: bool,
     report_error: Option<String>,
     notice: Option<(String, bool)>,
+    notice_text: String,
+    notice_since: Option<std::time::Instant>,
     lightbox: Option<usize>,
+    prompt_preview: Option<String>,
     report_rx: Option<Receiver<(String, Result<Report>)>>,
     test_rx: Option<Receiver<Result<(String, String)>>>,
     auto_rx: Receiver<String>,
@@ -247,6 +263,7 @@ impl TraceBitWindow {
         let report = analyzer.get_report(&local_date_key(now_ms()));
         let report_list = analyzer.list_reports();
         let interval_summaries = interval_analyzer.list(&local_date_key(now_ms()));
+        let interval_request = interval_analyzer.last_request();
         let status = recorder.status();
         let form = FormState::new(cx, &current);
         let tray = create_tray(status.running && status.enabled);
@@ -266,6 +283,7 @@ impl TraceBitWindow {
             report_list,
             interval_summaries,
             interval_error: None,
+            interval_request,
             status,
             draft: current,
             form,
@@ -273,7 +291,10 @@ impl TraceBitWindow {
             testing: false,
             report_error: None,
             notice: None,
+            notice_text: String::new(),
+            notice_since: None,
             lightbox: None,
+            prompt_preview: None,
             report_rx: None,
             test_rx: None,
             auto_rx,
@@ -300,12 +321,13 @@ impl TraceBitWindow {
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.expire_notice();
         self.status = self.recorder.status();
         self.poll_report_task();
         self.poll_test_task();
         self.poll_tray(window, cx);
         while let Ok(date_key) = self.auto_rx.try_recv() {
-            self.notice = Some(("今日日报已自动生成".to_owned(), true));
+            self.notice = Some(("效率建议已自动生成".to_owned(), true));
             if self.date_key() == date_key {
                 self.report = self.analyzer.get_report(&date_key);
             }
@@ -315,6 +337,7 @@ impl TraceBitWindow {
             match result {
                 Ok(date_key) => {
                     self.interval_error = None;
+                    self.interval_request = self.interval_analyzer.last_request();
                     if self.date_key() == date_key {
                         self.interval_summaries = self.interval_analyzer.list(&date_key);
                     }
@@ -332,13 +355,35 @@ impl TraceBitWindow {
         cx.notify();
     }
 
+    /// Toasts float above every page and dismiss themselves, instead of
+    /// appearing inline at the top of a page that may be scrolled away.
+    fn expire_notice(&mut self) {
+        let current = self
+            .notice
+            .as_ref()
+            .map(|(message, _)| message.clone())
+            .unwrap_or_default();
+        if current != self.notice_text {
+            self.notice_text = current;
+            self.notice_since = self.notice.as_ref().map(|_| std::time::Instant::now());
+        }
+        if self
+            .notice_since
+            .is_some_and(|since| since.elapsed() >= Duration::from_secs(8))
+        {
+            self.notice = None;
+            self.notice_since = None;
+            self.notice_text.clear();
+        }
+    }
+
     fn poll_report_task(&mut self) {
         let result = match self.report_rx.as_ref().map(|rx| rx.try_recv()) {
             Some(Ok(result)) => Some(result),
             Some(Err(TryRecvError::Disconnected)) => {
                 self.report_rx = None;
                 self.generating = false;
-                Some((self.date_key(), Err(anyhow::anyhow!("日报任务意外结束"))))
+                Some((self.date_key(), Err(anyhow::anyhow!("建议任务意外结束"))))
             }
             _ => None,
         };
@@ -348,7 +393,7 @@ impl TraceBitWindow {
             match result {
                 Ok(report) => {
                     self.report = Some(report);
-                    self.notice = Some(("行为日报已生成".to_owned(), true));
+                    self.notice = Some(("效率建议已生成".to_owned(), true));
                     self.report_list = self.analyzer.list_reports();
                 }
                 Err(error) => {
@@ -450,8 +495,20 @@ impl TraceBitWindow {
         self.reload_day();
         self.report = self.analyzer.get_report(&self.date_key());
         self.interval_summaries = self.interval_analyzer.list(&self.date_key());
+        self.interval_request = self.interval_analyzer.last_request();
         self.report_error = None;
         self.lightbox = None;
+        self.prompt_preview = None;
+    }
+
+    fn toggle_prompt_preview(&mut self) {
+        if self.prompt_preview.take().is_some() {
+            return;
+        }
+        match self.analyzer.preview_prompt(&self.date_key()) {
+            Ok(prompt) => self.prompt_preview = Some(prompt),
+            Err(error) => self.notice = Some((format!("无法生成预览：{error:#}"), false)),
+        }
     }
 
     fn shift_day(&mut self, days: i64) {
@@ -537,8 +594,7 @@ impl TraceBitWindow {
         if self.generating {
             return;
         }
-        let ai = self.settings.get().ai;
-        if ai.base_url.trim().is_empty() || ai.model.trim().is_empty() {
+        if !has_ai(&self.settings.get()) {
             self.view = View::Report;
             self.notice = Some(("请先配置 AI 接口地址和模型名".to_owned(), false));
             return;
@@ -557,6 +613,7 @@ impl TraceBitWindow {
         self.report_rx = Some(rx);
         self.generating = true;
         self.report_error = None;
+        self.prompt_preview = None;
     }
 
     fn save_settings_with_cx(&mut self, cx: &App) -> bool {
@@ -682,7 +739,7 @@ impl TraceBitWindow {
                         div()
                             .text_xs()
                             .text_color(rgb(SECONDARY))
-                            .child("Windows 活动记录与日报"),
+                            .child("Windows 活动记录与效率建议"),
                     ),
             )
             .child(
@@ -700,7 +757,7 @@ impl TraceBitWindow {
                         ),
                     )
                     .child(
-                        nav_button("nav-report", "AI 日报", self.view == View::Report).on_click(
+                        nav_button("nav-report", "AI 建议", self.view == View::Report).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.view = View::Report;
                                 this.reload_selected();
@@ -831,17 +888,38 @@ impl TraceBitWindow {
         head
     }
 
-    fn render_notice(&self) -> Option<Div> {
+    fn render_toast(&self, cx: &mut Context<Self>) -> Option<Div> {
         self.notice.as_ref().map(|(message, success)| {
             div()
-                .p_3()
-                .rounded_md()
-                .text_sm()
+                .absolute()
+                .bottom(px(24.))
+                .right(px(24.))
+                .w(px(400.))
+                .p_4()
+                .rounded_lg()
+                .shadow_lg()
                 .bg(rgb(SURFACE))
                 .border_1()
-                .border_color(rgb(DIVIDER))
-                .text_color(rgb(if *success { INK } else { RED }))
-                .child(message.clone())
+                .border_color(rgb(if *success { GREEN } else { RED }))
+                .flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_sm()
+                        .text_color(rgb(if *success { INK } else { RED }))
+                        .child(message.clone()),
+                )
+                .child(
+                    small_button("toast-close", "关闭", false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        },
+                    )),
+                )
         })
     }
 
@@ -862,7 +940,6 @@ impl TraceBitWindow {
                 true,
                 cx,
             ))
-            .children(self.render_notice())
             .child(self.render_status_strip());
         if self.day.events == 0 {
             return page.child(
@@ -1120,10 +1197,9 @@ impl TraceBitWindow {
                                     .text_xs()
                                     .text_color(rgb(FAINT))
                                     .child(
-                                        app.titles
-                                            .keys()
-                                            .take(2)
-                                            .cloned()
+                                        app.top_titles(2)
+                                            .into_iter()
+                                            .map(|(title, _)| title.clone())
                                             .collect::<Vec<_>>()
                                             .join(" · "),
                                     ),
@@ -1133,15 +1209,15 @@ impl TraceBitWindow {
     }
 
     fn render_categories(&self) -> Div {
-        let mut totals = BTreeMap::new();
-        for app in &self.day.apps {
-            *totals.entry(app.category.clone()).or_insert(0) += app.ms;
-        }
-        let mut totals = totals.into_iter().collect::<Vec<_>>();
-        totals.sort_by_key(|total| std::cmp::Reverse(total.1));
+        let totals = self
+            .day
+            .categories
+            .iter()
+            .map(|category| (category.name.clone(), category.ms))
+            .collect::<Vec<_>>();
         section()
             .gap_3()
-            .child(panel_head("时间构成", ""))
+            .child(panel_head("时间构成", "浏览器时间按网站归类"))
             .children(totals.into_iter().map(|(category, ms)| {
                 let fraction = ms as f32 / self.day.total_active_ms.max(1) as f32;
                 div()
@@ -1189,7 +1265,7 @@ impl TraceBitWindow {
         section()
             .gap_3()
             .child(panel_head(
-                "AI 行为日报",
+                "AI 效率建议",
                 if self.report.is_some() {
                     "已生成"
                 } else {
@@ -1198,22 +1274,27 @@ impl TraceBitWindow {
             ))
             .child(div().text_sm().text_color(rgb(SECONDARY)).child(
                 if let Some(report) = &self.report {
-                    report_excerpt(&report.markdown)
+                    report
+                        .advice
+                        .as_ref()
+                        .map(|advice| advice.headline.clone())
+                        .filter(|headline| !headline.is_empty())
+                        .unwrap_or_else(|| report_excerpt(&report.markdown))
                 } else if configured {
-                    "根据当天的应用使用和活跃时长生成日报。".to_owned()
+                    "找出今天最值得改变的行为，给出可执行的建议和明天的小实验。".to_owned()
                 } else {
-                    "连接模型后即可生成日报；截图分析可在设置中单独开启。".to_owned()
+                    "连接模型后即可生成建议；截图分析可在设置中单独开启。".to_owned()
                 },
             ))
             .child(
                 button(
                     "today-ai-action",
                     if self.generating {
-                        "正在生成…"
+                        "正在分析…"
                     } else if self.report.is_some() {
-                        "查看完整日报"
+                        "查看完整建议"
                     } else if configured {
-                        "生成今日日报"
+                        "生成今日建议"
                     } else {
                         "配置 AI"
                     },
@@ -1231,9 +1312,19 @@ impl TraceBitWindow {
     }
 
     fn render_interval_summaries(&self) -> Div {
-        let mut section = section()
-            .gap_3()
-            .child(panel_head("时段摘要", "独立分析截图，不进入 AI 日报"));
+        let mut section = section().gap_3().child(panel_head(
+            "时段摘要",
+            "视觉模型按时段总结截图，作为 AI 建议的依据",
+        ));
+        if let Some(request) = &self.interval_request {
+            section = section.child(div().text_xs().text_color(rgb(FAINT)).child(format!(
+                "上次发送：{} · {} 张截图 · {} · {}",
+                hhmm(request.at),
+                request.files.len(),
+                request.model,
+                request.endpoint
+            )));
+        }
         if let Some(error) = &self.interval_error {
             section = section.child(
                 div()
@@ -1312,9 +1403,10 @@ impl TraceBitWindow {
                                     ),
                             )
                             .child(div().text_xs().text_color(rgb(SECONDARY)).child(format!(
-                                "{} 次 · {}",
+                                "{} · {} 次 · {}",
+                                fmt_ms(site.ms),
                                 site.visits,
-                                hhmm(site.last_seen)
+                                site.category.clone().unwrap_or_else(|| "未归类".to_owned())
                             )))
                     })
                     .collect()
@@ -1386,12 +1478,12 @@ impl TraceBitWindow {
             .min_w(px(0.))
             .gap_5()
             .child(self.render_page_head(
-                "AI 行为日报",
-                "根据当天的应用使用、活跃时长和窗口标题生成",
+                "AI 效率建议",
+                "从当天记录中找出最值得改变的行为，给出可执行的建议和可验证的小实验",
                 true,
                 cx,
-            ))
-            .children(self.render_notice());
+            ));
+
         if !has_ai(&self.settings.get()) {
             return page.child(self.render_ai_setup(cx));
         }
@@ -1400,8 +1492,9 @@ impl TraceBitWindow {
                 .flex()
                 .justify_between()
                 .items_center()
+                .gap_3()
                 .child(panel_head(
-                    &format!("{} 报告", self.date_key()),
+                    &format!("{} 建议", self.date_key()),
                     &format!(
                         "已记录 {} · {} 次切换",
                         fmt_ms(self.day.total_active_ms),
@@ -1409,32 +1502,84 @@ impl TraceBitWindow {
                     ),
                 ))
                 .child(
-                    button(
-                        "generate-report",
-                        if self.generating {
-                            "正在生成…"
-                        } else if self.report.is_some() {
-                            "重新生成"
-                        } else {
-                            "生成日报"
-                        },
-                        true,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.generating {
-                            this.generate_report();
-                        }
-                        cx.notify();
-                    })),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            small_button(
+                                "preview-prompt",
+                                if self.prompt_preview.is_some() {
+                                    "收起发送内容"
+                                } else {
+                                    "查看发送内容"
+                                },
+                                self.prompt_preview.is_some(),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_prompt_preview();
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            button(
+                                "generate-report",
+                                if self.generating {
+                                    "正在分析…"
+                                } else if self.report.is_some() {
+                                    "重新生成"
+                                } else {
+                                    "生成建议"
+                                },
+                                true,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.generating {
+                                    this.generate_report();
+                                }
+                                cx.notify();
+                            })),
+                        ),
                 ),
         );
+        if let Some(preview) = &self.prompt_preview {
+            let mut block = div()
+                .flex()
+                .flex_col()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(CANVAS))
+                .border_1()
+                .border_color(rgb(DIVIDER))
+                .text_xs()
+                .text_color(rgb(SECONDARY))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(INK))
+                        .pb_2()
+                        .child("生成建议时会把以下内容发送给 AI 接口（不含截图、网站域名和密钥）"),
+                );
+            for (index, line) in preview.lines().enumerate() {
+                block = block.child(
+                    div()
+                        .id(SharedString::from(format!("preview-line-{index}")))
+                        .child(if line.is_empty() {
+                            " ".to_owned()
+                        } else {
+                            line.to_owned()
+                        }),
+                );
+            }
+            document = document.child(block);
+        }
         if self.generating {
             document = document.child(
                 div()
                     .p_8()
                     .text_center()
                     .text_color(rgb(SECONDARY))
-                    .child("正在整理记录并请求模型，通常需要几十秒。"),
+                    .child("正在计算证据并请求模型，通常需要几十秒。"),
             );
         } else if let Some(error) = &self.report_error {
             document = document.child(
@@ -1448,16 +1593,35 @@ impl TraceBitWindow {
                     .child(error.clone()),
             );
         } else if let Some(report) = &self.report {
-            document = document.child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(rgb(FAINT))
-                    .child(format!("模型 {}", report.model))
-                    .child(format!("活跃 {} 分钟", report.active_minutes))
-                    .child(format!("工具化机会 {} 项", report.recommendation_count)),
-            );
+            let mut meta = div()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .text_xs()
+                .text_color(rgb(FAINT))
+                .child(format!("模型 {}", report.model))
+                .child(format!(
+                    "{} · {}",
+                    if report.source == "auto" {
+                        "自动生成"
+                    } else {
+                        "手动生成"
+                    },
+                    crate::store::local_datetime(report.generated_at)
+                        .map(|date| date.format("%m-%d %H:%M").to_string())
+                        .unwrap_or_default()
+                ))
+                .child(format!("证据 {} 条", report.evidence.len()));
+            if report.usage.prompt_tokens + report.usage.completion_tokens > 0 {
+                meta = meta.child(format!(
+                    "Token {} + {}",
+                    report.usage.prompt_tokens, report.usage.completion_tokens
+                ));
+            }
+            if !report.prompt_version.is_empty() {
+                meta = meta.child(report.prompt_version.clone());
+            }
+            document = document.child(meta);
             for (index, line) in report.markdown.lines().enumerate() {
                 document = document.child(render_markdown_line(index, line));
             }
@@ -1467,7 +1631,7 @@ impl TraceBitWindow {
                     .p_8()
                     .text_center()
                     .text_color(rgb(SECONDARY))
-                    .child("还没有这一天的日报，点击右上角“生成日报”。"),
+                    .child("还没有这一天的建议，点击右上角“生成建议”。"),
             );
         }
         page.child(document).child(self.render_report_history(cx))
@@ -1476,17 +1640,17 @@ impl TraceBitWindow {
     fn render_ai_setup(&mut self, cx: &mut Context<Self>) -> Div {
         panel().gap_4().child(panel_head("先连接一个 AI 模型", "支持 DeepSeek、通义、Kimi、OpenAI 和本地 Ollama"))
             .child(setting_row("接口地址", "本地 Ollama：http://localhost:11434/v1", self.form.base_url.clone()))
-            .child(setting_row("API Key", "密钥只保存在本机设置文件中", self.form.api_key.clone()))
-            .child(setting_row("模型名", "例如 deepseek-chat、qwen-plus、gpt-4o-mini", self.form.model.clone()))
+            .child(setting_row("API Key", "使用 Windows DPAPI 加密保存在本机", self.form.api_key.clone()))
+            .child(setting_row("模型名", "建议多模态模型，如 qwen2.5vl、gpt-4o-mini", self.form.model.clone()))
             .child(button("report-ai-save", if self.testing { "正在测试…" } else { "保存并测试" }, true).on_click(cx.listener(|this, _, _, cx| { this.test_ai(cx); cx.notify(); })))
-            .child(div().text_sm().text_color(rgb(SECONDARY)).child("日报只发送脱敏文本统计，不发送网站域名、API Key 或键盘输入。截图仅在开启“自动分析屏幕截图”后按时段发送。"))
+            .child(div().text_sm().text_color(rgb(SECONDARY)).child("建议只发送本地计算的脱敏证据（聊天窗口只保留应用名），不发送网站域名、API Key 或键盘输入。可以随时点击“查看发送内容”核对。"))
     }
 
     fn render_report_history(&self, cx: &mut Context<Self>) -> Div {
         panel()
             .gap_2()
             .child(panel_head(
-                "历史日报",
+                "历史建议",
                 &format!("{} 份", self.report_list.len()),
             ))
             .children(self.report_list.iter().take(30).map(|item| {
@@ -1526,8 +1690,8 @@ impl TraceBitWindow {
             .w_full()
             .min_w(px(0.))
             .gap_5()
-            .child(self.render_page_head("设置", "修改后点击“保存设置”生效", false, cx))
-            .children(self.render_notice());
+            .child(self.render_page_head("设置", "修改后点击“保存设置”生效", false, cx));
+
         let recording = panel()
             .gap_4()
             .child(panel_head("记录", "开始和暂停也可以使用左侧固定按钮"))
@@ -1567,10 +1731,18 @@ impl TraceBitWindow {
                 "空闲阈值",
                 "无键鼠输入超过该分钟数后，不计入活跃时长",
                 self.form.idle.clone(),
+            ))
+            .child(setting_row(
+                "会议与全屏空闲阈值",
+                "开会、看视频或放映时不碰键鼠也算活跃，单位：分钟",
+                self.form.passive_idle.clone(),
             ));
         let ai = panel()
             .gap_4()
-            .child(panel_head("AI 分析", "OpenAI 兼容接口，密钥只保存在本机"))
+            .child(panel_head(
+                "AI 分析",
+                "OpenAI 兼容接口，密钥用 Windows DPAPI 加密保存",
+            ))
             .child(setting_row(
                 "接口地址",
                 "例如 https://api.deepseek.com/v1",
@@ -1583,12 +1755,12 @@ impl TraceBitWindow {
             ))
             .child(setting_row(
                 "模型名",
-                "例如 deepseek-chat、qwen-plus",
+                "例如 qwen2.5vl、gpt-4o-mini。开启截图分析时必须支持图片输入",
                 self.form.model.clone(),
             ))
             .child(self.toggle_row(
                 "自动分析屏幕截图",
-                "将该时段截图发送到当前 AI 接口，需视觉模型",
+                "按时段把截图交给上方模型总结，作为建议的依据。需要支持图片输入的多模态模型",
                 self.draft.ai.screenshot_analysis,
                 cx.listener(|this, _, _, cx| {
                     this.draft.ai.screenshot_analysis = !this.draft.ai.screenshot_analysis;
@@ -1602,7 +1774,7 @@ impl TraceBitWindow {
             ))
             .child(self.toggle_row(
                 "每日自动生成",
-                "到点分析当天记录并发送系统通知",
+                "到点生成当天建议；错过时间或之后仍有大量活动会在次日补生成，不覆盖手动生成的建议",
                 self.draft.ai.auto_report,
                 cx.listener(|this, _, _, cx| {
                     this.draft.ai.auto_report = !this.draft.ai.auto_report;
@@ -1690,11 +1862,11 @@ impl TraceBitWindow {
                 .gap_4()
                 .child(panel_head(
                     "隐私与存储",
-                    "敏感窗口不截图；截图分析需单独开启",
+                    "敏感窗口不记录标题、不截图",
                 ))
                 .child(setting_row(
                     "敏感内容关键词",
-                    "用逗号分隔。前台应用或标题命中时跳过截图",
+                    "用逗号分隔。前台应用、标题或网站命中时，标题写为“[敏感窗口]”，且不截图、不记录网站",
                     self.form.patterns.clone(),
                 ))
                 .child(setting_row(
@@ -1986,6 +2158,7 @@ impl Render for TraceBitWindow {
                     .child(content),
             )
             .children(self.render_lightbox(window, cx))
+            .children(self.render_toast(cx))
     }
 }
 
@@ -2015,7 +2188,7 @@ fn create_tray(active: bool) -> Option<TrayState> {
         None,
     );
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
-    let report = MenuItem::with_id("report", "生成今日日报", true, None);
+    let report = MenuItem::with_id("report", "查看效率建议", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let menu = Menu::new();
     menu.append_items(&[&status, &toggle, &show, &report, &quit])
@@ -2040,13 +2213,7 @@ fn create_tray(active: bool) -> Option<TrayState> {
 fn load_day(store: &DayStore, settings: &Settings, date_key: &str) -> DayStats {
     let recording = settings.get().recording;
     store
-        .day_stats(
-            date_key,
-            DeriveOptions {
-                idle_threshold_ms: recording.idle_threshold_ms,
-                session_gap_ms: recording.session_gap_ms,
-            },
-        )
+        .day_stats(date_key, DeriveOptions::from_settings(&recording))
         .unwrap_or_else(|error| {
             eprintln!("[Store] {error:#}");
             store.derive(&[], DeriveOptions::default())
@@ -2304,6 +2471,7 @@ fn category_color(category: &str) -> u32 {
         "会议" => 0xb95b5b,
         "设计" => 0xb86e52,
         "娱乐" => 0x64864f,
+        "资讯社交" => 0x5f7f99,
         "工具" => 0x7c8285,
         "系统" => 0x8c8c86,
         _ => 0x92928b,
@@ -2341,11 +2509,10 @@ pub fn run() -> Result<()> {
     let settings = Arc::new(Settings::load(&user_dir));
     let store = Arc::new(DayStore::new(user_dir.join("data"))?);
     let recorder = Recorder::new(settings.clone(), store.clone());
-    let analyzer = Arc::new(Analyzer::new(
-        settings.clone(),
-        store.clone(),
-        user_dir.join("reports"),
-    )?);
+    let analyzer = Arc::new(
+        Analyzer::new(settings.clone(), store.clone(), user_dir.join("reports"))?
+            .with_intervals(user_dir.join("intervals")),
+    );
     let interval_analyzer = Arc::new(IntervalAnalyzer::new(
         settings.clone(),
         store.clone(),
@@ -2433,34 +2600,70 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Generates advice automatically: today once the scheduled time has passed, and
+/// yesterday if it was missed (machine asleep, app started late) or its automatic
+/// report predates substantial later activity. Manual reports are never replaced.
 fn spawn_auto_report(
     settings: Arc<Settings>,
     analyzer: Arc<Analyzer>,
     sender: std::sync::mpsc::Sender<String>,
 ) {
     thread::spawn(move || {
-        let mut attempted = String::new();
+        let mut retry_after: BTreeMap<String, std::time::Instant> = BTreeMap::new();
+        let mut first = true;
         loop {
-            thread::sleep(Duration::from_secs(30));
+            if !first {
+                thread::sleep(Duration::from_secs(60));
+            }
+            first = false;
             let ai = settings.get().ai;
-            if !ai.auto_report || ai.base_url.is_empty() || ai.model.is_empty() {
+            if !ai.auto_report || !ai.text_endpoint().configured() {
                 continue;
             }
             let now = Local::now();
-            let date_key = now.format("%Y-%m-%d").to_string();
-            if now.format("%H:%M").to_string() != ai.auto_report_time || attempted == date_key {
-                continue;
+            let today = now.format("%Y-%m-%d").to_string();
+            let yesterday = (now - ChronoDuration::days(1))
+                .format("%Y-%m-%d")
+                .to_string();
+            let mut due = Vec::new();
+            if let Some(scheduled) = crate::analyzer::scheduled_ts(&yesterday, &ai.auto_report_time)
+                && analyzer.needs_auto_report(&yesterday, scheduled)
+            {
+                due.push(yesterday);
             }
-            attempted = date_key.clone();
-            match analyzer.generate_report(&date_key) {
-                Ok(_) => {
-                    platform::show_notification(
-                        "TraceBit 日报已生成",
-                        &format!("{date_key} 的行为日报已就绪"),
-                    );
-                    let _ = sender.send(date_key);
+            if let Some(scheduled) = crate::analyzer::scheduled_ts(&today, &ai.auto_report_time)
+                && now.timestamp_millis() >= scheduled
+                && analyzer
+                    .get_report(&today)
+                    .is_none_or(|report| report.source == "auto" && report.generated_at < scheduled)
+                && analyzer.needs_auto_report(&today, scheduled)
+            {
+                due.push(today);
+            }
+            for date_key in due {
+                if retry_after
+                    .get(&date_key)
+                    .is_some_and(|until| *until > std::time::Instant::now())
+                {
+                    continue;
                 }
-                Err(error) => eprintln!("[AutoReport] {error:#}"),
+                match analyzer.generate_report_as(&date_key, "auto") {
+                    Ok(_) => {
+                        retry_after.remove(&date_key);
+                        platform::show_notification(
+                            "TraceBit 效率建议已生成",
+                            &format!("{date_key} 的效率建议已就绪"),
+                        );
+                        let _ = sender.send(date_key);
+                    }
+                    Err(error) => {
+                        eprintln!("[AutoReport] {error:#}");
+                        retry_after.insert(
+                            date_key,
+                            std::time::Instant::now() + Duration::from_secs(30 * 60),
+                        );
+                    }
+                }
             }
         }
     });
@@ -2485,7 +2688,7 @@ fn spawn_interval_analysis(
                 retry_after = None;
                 previous_config = config;
             }
-            if !ai.screenshot_analysis || ai.base_url.is_empty() || ai.model.is_empty() {
+            if !ai.screenshot_analysis || !ai.text_endpoint().configured() {
                 continue;
             }
             if retry_after.is_some_and(|until| until > std::time::Instant::now()) {

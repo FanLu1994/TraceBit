@@ -10,6 +10,12 @@ pub struct ForegroundSample {
     pub pid: u32,
     pub idle_ms: i64,
     pub site: String,
+    /// The foreground window covers its whole monitor (video, slides, games).
+    #[serde(default)]
+    pub fullscreen: bool,
+    /// Center of the foreground window in virtual-screen coordinates.
+    #[serde(skip)]
+    pub center: Option<(i32, i32)>,
 }
 
 #[cfg(windows)]
@@ -22,7 +28,10 @@ mod imp {
     };
     use windows::{
         Win32::{
-            Foundation::{CloseHandle, HANDLE, HWND},
+            Foundation::{CloseHandle, HANDLE, HWND, RECT},
+            Graphics::Gdi::{
+                GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+            },
             Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
             System::{
                 Com::{
@@ -42,12 +51,14 @@ mod imp {
             },
             UI::{
                 Accessibility::{
-                    CUIAutomation, IUIAutomation, IUIAutomationValuePattern, TreeScope_Descendants,
-                    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_ValuePatternId,
+                    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
+                    TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
+                    UIA_ValuePatternId,
                 },
                 Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
                 WindowsAndMessaging::{
-                    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+                    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
+                    GetWindowThreadProcessId,
                 },
             },
         },
@@ -61,9 +72,17 @@ mod imp {
     }
 
     pub struct NativeSampler {
-        process_cache: HashMap<u32, ProcessInfo>,
+        /// Keyed by executable path, not PID: Windows reuses PIDs, and reading the
+        /// version resource is the expensive part of the lookup.
+        label_cache: HashMap<PathBuf, String>,
         automation: Option<IUIAutomation>,
         com_initialized: bool,
+        /// Last address-bar element per browser window, so the costly descendant
+        /// search only runs when the element goes stale.
+        address_bar: Option<(isize, IUIAutomationElement)>,
+        /// (window, title) -> host. Tabs and navigations change the title, so an
+        /// unchanged title means the host is unchanged too.
+        site_cache: Option<(isize, String, String)>,
     }
 
     impl NativeSampler {
@@ -75,9 +94,11 @@ mod imp {
                 None
             };
             Self {
-                process_cache: HashMap::new(),
+                label_cache: HashMap::new(),
                 automation,
                 com_initialized,
+                address_bar: None,
+                site_cache: None,
             }
         }
 
@@ -98,10 +119,11 @@ mod imp {
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
                 let process = self.process_info(pid);
                 let site = if capture_sites {
-                    self.browser_site(&process.name, hwnd)
+                    self.browser_site(&process.name, hwnd, &title)
                 } else {
                     String::new()
                 };
+                let (fullscreen, center) = window_geometry(hwnd);
                 ForegroundSample {
                     app: process.label,
                     name: process.name,
@@ -109,31 +131,63 @@ mod imp {
                     pid,
                     idle_ms,
                     site,
+                    fullscreen,
+                    center,
                 }
             }
         }
 
         fn process_info(&mut self, pid: u32) -> ProcessInfo {
-            if let Some(info) = self.process_cache.get(&pid) {
-                return info.clone();
-            }
             let path = process_path(pid).unwrap_or_default();
             let name = path
                 .file_stem()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let label = file_description(&path)
-                .filter(|label| !label.is_empty())
-                .unwrap_or_else(|| name.clone());
-            let info = ProcessInfo { label, name };
-            if self.process_cache.len() > 400 {
-                self.process_cache.clear();
-            }
-            self.process_cache.insert(pid, info.clone());
-            info
+            let label = if let Some(label) = self.label_cache.get(&path) {
+                label.clone()
+            } else {
+                let label = file_description(&path)
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| name.clone());
+                if self.label_cache.len() > 400 {
+                    self.label_cache.clear();
+                }
+                self.label_cache.insert(path, label.clone());
+                label
+            };
+            ProcessInfo { label, name }
         }
 
-        fn browser_site(&self, process_name: &str, hwnd: HWND) -> String {
+        fn browser_site(&mut self, process_name: &str, hwnd: HWND, title: &str) -> String {
+            let key = hwnd.0 as isize;
+            if let Some((cached_hwnd, cached_title, site)) = &self.site_cache
+                && *cached_hwnd == key
+                && cached_title == title
+            {
+                return site.clone();
+            }
+            if let Some((cached_hwnd, element)) = &self.address_bar
+                && *cached_hwnd == key
+            {
+                let value = unsafe {
+                    element
+                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                        .and_then(|pattern| pattern.CurrentValue())
+                };
+                if let Ok(value) = value {
+                    let site = crate::recorder::normalize_site_host(&value.to_string());
+                    if !site.is_empty() {
+                        self.site_cache = Some((key, title.to_owned(), site.clone()));
+                        return site;
+                    }
+                }
+            }
+            let site = self.search_address_bar(process_name, hwnd);
+            self.site_cache = Some((key, title.to_owned(), site.clone()));
+            site
+        }
+
+        fn search_address_bar(&mut self, process_name: &str, hwnd: HWND) -> String {
             const BROWSERS: [&str; 6] =
                 ["chrome", "msedge", "brave", "opera", "vivaldi", "firefox"];
             if !BROWSERS.contains(&process_name.to_lowercase().as_str()) {
@@ -183,6 +237,7 @@ mod imp {
                     if let Ok(value) = pattern.CurrentValue() {
                         let site = crate::recorder::normalize_site_host(&value.to_string());
                         if !site.is_empty() {
+                            self.address_bar = Some((hwnd.0 as isize, element));
                             return site;
                         }
                     }
@@ -192,8 +247,42 @@ mod imp {
         }
     }
 
+    /// Returns (covers its whole monitor, window center). The desktop and taskbar
+    /// also cover the monitor, so they are excluded by window class.
+    fn window_geometry(hwnd: HWND) -> (bool, Option<(i32, i32)>) {
+        unsafe {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return (false, None);
+            }
+            let center = Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2));
+            let mut class = [0_u16; 64];
+            let length = GetClassNameW(hwnd, &mut class).max(0) as usize;
+            let class = String::from_utf16_lossy(&class[..length.min(64)]);
+            if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+                return (false, center);
+            }
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return (false, center);
+            }
+            let screen = info.rcMonitor;
+            let fullscreen = rect.left <= screen.left
+                && rect.top <= screen.top
+                && rect.right >= screen.right
+                && rect.bottom >= screen.bottom;
+            (fullscreen, center)
+        }
+    }
+
     impl Drop for NativeSampler {
         fn drop(&mut self) {
+            self.address_bar.take();
+            self.site_cache.take();
             self.automation.take();
             if self.com_initialized {
                 unsafe { CoUninitialize() };

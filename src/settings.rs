@@ -29,6 +29,9 @@ pub struct RecordingSettings {
     pub focus_debounce_ms: u64,
     pub heartbeat_ms: u64,
     pub idle_threshold_ms: i64,
+    /// Idle threshold while the user is plausibly watching or listening without
+    /// touching input: meetings and full-screen windows (video, slides).
+    pub passive_idle_threshold_ms: i64,
     pub session_gap_ms: i64,
 }
 
@@ -44,6 +47,7 @@ impl Default for RecordingSettings {
             focus_debounce_ms: 2_000,
             heartbeat_ms: 300_000,
             idle_threshold_ms: 60_000,
+            passive_idle_threshold_ms: 900_000,
             session_gap_ms: 600_000,
         }
     }
@@ -144,6 +148,30 @@ impl Default for AiSettings {
     }
 }
 
+/// One OpenAI-compatible endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl Endpoint {
+    pub fn configured(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
+}
+
+impl AiSettings {
+    pub fn text_endpoint(&self) -> Endpoint {
+        Endpoint {
+            base_url: self.base_url.trim().to_owned(),
+            api_key: self.api_key.trim().to_owned(),
+            model: self.model.trim().to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
@@ -172,7 +200,11 @@ impl Settings {
         let data = fs::read_to_string(&file)
             .ok()
             .and_then(|raw| {
-                serde_json::from_str(&raw)
+                serde_json::from_str::<Value>(&raw)
+                    .and_then(|mut value| {
+                        unprotect_secrets(&mut value);
+                        serde_json::from_value(value)
+                    })
                     .map_err(|err| {
                         eprintln!("[Settings] 读取失败，使用默认设置：{err}");
                         err
@@ -209,8 +241,56 @@ impl Settings {
         if let Some(parent) = self.file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_vec_pretty(data)?;
+        let mut value = serde_json::to_value(data)?;
+        protect_secrets(&mut value)?;
+        let json = serde_json::to_vec_pretty(&value)?;
         fs::write(&self.file, json).with_context(|| format!("无法保存 {}", self.file.display()))
+    }
+}
+
+/// API keys are stored encrypted with Windows DPAPI (bound to the current user),
+/// never as plaintext in settings.json.
+const SECRET_FIELDS: [&str; 2] = ["apiKey", "searchApiKey"];
+
+fn protect_secrets(value: &mut Value) -> Result<()> {
+    let Some(ai) = value.get_mut("ai").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for field in SECRET_FIELDS {
+        let plain = ai
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        ai.insert(field.to_owned(), Value::String(String::new()));
+        ai.remove(&format!("{field}Protected"));
+        if !plain.is_empty() {
+            ai.insert(
+                format!("{field}Protected"),
+                Value::String(crate::secret::protect(&plain)?),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn unprotect_secrets(value: &mut Value) {
+    let Some(ai) = value.get_mut("ai").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in SECRET_FIELDS {
+        let Some(sealed) = ai
+            .remove(&format!("{field}Protected"))
+            .and_then(|value| value.as_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        match crate::secret::unprotect(&sealed) {
+            Ok(plain) => {
+                ai.insert(field.to_owned(), Value::String(plain));
+            }
+            Err(error) => eprintln!("[Settings] 无法解密 {field}：{error:#}"),
+        }
     }
 }
 
@@ -269,6 +349,32 @@ mod tests {
 
         let loaded = Settings::load(temp.path()).get();
         assert_eq!(loaded, next);
+    }
+
+    #[test]
+    fn api_keys_are_not_stored_in_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(temp.path());
+        settings
+            .patch(&json!({"ai": {"apiKey": "sk-plaintext-secret-123", "searchApiKey": "brave-secret"}}))
+            .unwrap();
+        let raw = fs::read_to_string(temp.path().join("settings.json")).unwrap();
+        assert!(!raw.contains("sk-plaintext-secret-123"));
+        assert!(!raw.contains("brave-secret"));
+        let loaded = Settings::load(temp.path()).get();
+        assert_eq!(loaded.ai.api_key, "sk-plaintext-secret-123");
+        assert_eq!(loaded.ai.search_api_key, "brave-secret");
+    }
+
+    #[test]
+    fn legacy_plaintext_keys_still_load() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("settings.json"),
+            r#"{"ai":{"apiKey":"sk-legacy"}}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load(temp.path()).get().ai.api_key, "sk-legacy");
     }
 
     #[test]
