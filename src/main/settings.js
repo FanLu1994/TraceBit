@@ -7,6 +7,7 @@ const DEFAULTS = {
   recording: {
     enabled: true,          // master switch
     screenshots: true,      // capture screen snapshots
+    browserSites: false,    // opt-in: record active browser site hostnames locally
     pollMs: 2000,           // foreground poll interval
     tickMs: 30000,          // periodic activity tick
     titleThrottleMs: 8000,  // min gap between title-change events

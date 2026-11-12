@@ -38,6 +38,8 @@ class Recorder {
     this.rotationTimer = null;
     this.pendingCaptureTimer = null;
     this.captureInFlight = false;
+    this.lastSiteKey = null;
+    this.lastSiteAt = 0;
     this.prevGray = null;   // Buffer of THUMB_W*THUMB_H luma bytes
     this.prevHist = null;   // Float32Array(HIST_BINS)
     this.prevHash = null;
@@ -95,6 +97,8 @@ class Recorder {
     if (this.rotationTimer) { clearInterval(this.rotationTimer); this.rotationTimer = null; }
     if (this.pendingCaptureTimer) { clearTimeout(this.pendingCaptureTimer); this.pendingCaptureTimer = null; }
     this.prevGray = this.prevHist = this.prevHash = null;
+    this.lastSiteKey = null;
+    this.lastSiteAt = 0;
     console.log('[Recorder] stopped');
     this.emitStatus();
   }
@@ -160,6 +164,7 @@ class Recorder {
       '-TickMs', String(cfg.tickMs),
       '-TitleThrottleMs', String(cfg.titleThrottleMs),
     ];
+    if (cfg.browserSites) args.push('-CaptureBrowserSites');
     const child = spawn('powershell.exe', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     this.poller = child;
     this.rl = readline.createInterface({ input: child.stdout });
@@ -223,6 +228,7 @@ class Recorder {
       } else {
         this.idle = false;
       }
+      this.recordSite(ev.site, fm, idleMs, ev.t);
       // schedule a screenshot on app change (debounced)
       if (appChanged && !this.idle && !this.locked && !this.suspended && this.cfg().screenshots) {
         this.scheduleFocusCapture();
@@ -241,6 +247,7 @@ class Recorder {
         this.store.append({ kind: 'tick', data: { i: idleMs } });
       }
       // idle ticks are not stored (no information)
+      this.recordSite(ev.site, this.frontmost, idleMs, ev.t);
     }
     if (wasIdle !== this.idle) this.emitStatus();
     else this.emitStatus(); // frontmost may have changed
@@ -253,6 +260,24 @@ class Recorder {
       this.pendingCaptureTimer = null;
       this.capture('app_focus').catch(() => {});
     }, debounce);
+  }
+
+  recordSite(value, frontmost, idleMs, ts) {
+    if (!this.cfg().browserSites || !frontmost || this.locked || this.suspended || this.idle) return;
+    if (idleMs >= 0 && idleMs >= this.cfg().idleThresholdMs) return;
+    if (this.isSensitive()) return;
+    const site = normalizeSiteHost(value);
+    if (!site) return;
+    const now = typeof ts === 'number' ? ts : Date.now();
+    const key = `${frontmost.name || frontmost.app}\n${site}`;
+    if (key === this.lastSiteKey && now - this.lastSiteAt < 300000) return;
+    this.lastSiteKey = key;
+    this.lastSiteAt = now;
+    this.store.append({
+      ts: now,
+      kind: 'site_visit',
+      data: { site, app: frontmost.app, name: frontmost.name, pid: frontmost.pid, i: idleMs },
+    });
   }
 
   // ------------------------------------------------------------- sensitive
@@ -384,6 +409,25 @@ function pixelDiff(a, b, tol) {
   return changed / n;
 }
 
+function normalizeSiteHost(value) {
+  try {
+    let candidate = String(value || '').trim();
+    if (!candidate || candidate.length > 4096 || /\s/.test(candidate)) return '';
+    const scheme = /^([a-z][a-z\d+.-]*):/i.exec(candidate);
+    if (scheme && !/^https?$/i.test(scheme[1])) return '';
+    if (!scheme) candidate = 'https://' + candidate;
+    const url = new URL(candidate);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    let host = url.hostname.toLowerCase().replace(/\.$/, '');
+    if (host.startsWith('www.')) host = host.slice(4);
+    if (!host || host.length > 253) return '';
+    if (host !== 'localhost' && !host.includes('.') && !host.includes(':')) return '';
+    return host;
+  } catch {
+    return '';
+  }
+}
+
 const { localDateKey } = require('./store');
 
-module.exports = { Recorder };
+module.exports = { Recorder, normalizeSiteHost };

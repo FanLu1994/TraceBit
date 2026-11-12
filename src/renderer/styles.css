@@ -258,6 +258,19 @@ select { min-width: 150px; }
 .app-titles .title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .empty-row { padding: 28px 18px; color: var(--ink-secondary); }
 
+/* Locally recorded browser sites */
+.site-list { padding: 0 18px; }
+.site-row {
+  min-height: 60px; display: flex; align-items: center; gap: 18px;
+  padding: 10px 0; border-bottom: 1px solid var(--divider-soft);
+}
+.site-row:last-child { border-bottom: 0; }
+.site-main { flex: 1; min-width: 0; }
+.site-name { font-weight: 650; overflow-wrap: anywhere; }
+.site-app { margin-top: 2px; color: var(--ink-faint); font-size: 12px; }
+.site-visits { color: var(--ink-secondary); font-size: 12px; white-space: nowrap; }
+.site-time { width: 52px; color: var(--ink-secondary); text-align: right; font-variant-numeric: tabular-nums; }
+
 /* Category and AI panels */
 .category-list { padding: 5px 18px 15px; }
 .category-row { padding: 11px 0; border-bottom: 1px solid var(--divider-soft); }

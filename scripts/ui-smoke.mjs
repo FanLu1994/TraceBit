@@ -99,6 +99,7 @@ try {
   await waitFor(() => evaluate(`typeof state !== 'undefined' && state.settings && state.status && document.querySelector('#rec-toggle')`), 'renderer boot');
 
   assert(await evaluate(`state.settings.recording.enabled === true && state.status.enabled === true`), 'Recording should start enabled in a fresh profile');
+  assert(await evaluate(`state.settings.recording.browserSites === false`), 'Browser site recording must be opt-in');
 
   await evaluate(`document.querySelector('#rec-toggle').click()`);
   await waitFor(() => evaluate(`state.status.enabled === false && !state.toggling`), 'pause status');
@@ -118,6 +119,11 @@ try {
   await sleep(250); // allow the 140ms switch color transition to finish
   const switchVisual = await evaluate(`(()=>{const el=document.querySelector('#rec-enabled');const track=document.querySelector('#rec-enabled + .switch-track');return {checked:el.checked,matches:el.matches(':checked'),trackMatches:track.matches('.switch input:checked + .switch-track'),input:el.outerHTML,color:getComputedStyle(track).backgroundColor}})()`);
   assert(switchVisual.color === 'rgb(36, 35, 31)', `Settings switch visual state did not update after global resume: ${JSON.stringify(switchVisual)}`);
+  assert(await evaluate(`document.querySelector('#rec-sites').checked === false`), 'Browser site switch should start off');
+  await evaluate(`(()=>{document.querySelector('#rec-sites').click();document.querySelector('#save-settings').click()})()`);
+  await waitFor(() => evaluate(`state.settings.recording.browserSites === true && document.querySelector('#save-status').textContent === '已保存'`), 'browser site opt-in save');
+  assert(await evaluate(`window.tracebit.getState().then(s => s.settings.recording.browserSites === true)`), 'Browser site opt-in was not persisted');
+  assert(await evaluate(`document.querySelector('#rec-sites').closest('.setting-control').querySelector('.switch-label').textContent === '已开启'`), 'Browser site switch label did not update');
   await evaluate(`document.querySelector('#toasts').innerHTML = ''`);
   await screenshot('settings-1240.png');
 
@@ -131,6 +137,9 @@ try {
 
   await evaluate(`setView('today')`);
   await waitFor(() => evaluate(`Boolean(document.querySelector('.status-strip'))`), 'today render');
+  await evaluate(`(()=>{state.day={...state.day,exists:true,sites:[{site:'example.com',visits:2,firstSeen:Date.now()-60000,lastSeen:Date.now(),app:'Chrome'}]};renderToday()})()`);
+  await waitFor(() => evaluate(`document.querySelector('.site-name')?.textContent === 'example.com'`), 'browser site history render');
+  assert(await evaluate(`document.querySelector('.site-visits')?.textContent === '2 次记录'`), 'Browser site visit count did not render');
   await evaluate(`document.querySelector('#toasts').innerHTML = ''`);
   await sleep(500);
   await screenshot('today-1240.png');
@@ -147,6 +156,8 @@ try {
   console.log('UI smoke passed');
   console.log('  ✓ pause/resume updates runtime, persisted settings and settings checkbox');
   console.log('  ✓ primary action has explicit start/pause labels');
+  console.log('  ✓ browser site recording defaults off and persists explicit opt-in');
+  console.log('  ✓ recorded browser domains render in today view');
   console.log('  ✓ unconfigured AI report offers inline setup');
   console.log('  ✓ inline AI save/test reaches a configured report page');
   console.log('  ✓ today and settings fit 1240px and 960px viewports');

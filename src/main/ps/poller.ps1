@@ -7,7 +7,8 @@
 param(
   [int]$IntervalMs = 2000,
   [int]$TickMs = 30000,
-  [int]$TitleThrottleMs = 8000
+  [int]$TitleThrottleMs = 8000,
+  [switch]$CaptureBrowserSites
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -26,6 +27,63 @@ public class TBWin {
   public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
 }
 "@
+
+if ($CaptureBrowserSites) {
+  try {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+  } catch {
+    [Console]::Error.WriteLine('Unable to load Windows UI Automation; browser site capture is unavailable.')
+  }
+}
+
+function Get-SiteHost([string]$Value) {
+  if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+  $candidate = $Value.Trim()
+  if ($candidate.Length -gt 4096 -or $candidate -match '\s') { return '' }
+  $scheme = [regex]::Match($candidate, '^([a-zA-Z][a-zA-Z0-9+.-]*):')
+  if ($scheme.Success -and $scheme.Groups[1].Value -notmatch '^(?i)https?$') { return '' }
+  if (-not $scheme.Success) { $candidate = 'https://' + $candidate }
+
+  try {
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($candidate, [System.UriKind]::Absolute, [ref]$uri)) { return '' }
+    if ($uri.Scheme -ne 'http' -and $uri.Scheme -ne 'https') { return '' }
+    $hostName = $uri.IdnHost.ToLowerInvariant().TrimEnd('.')
+    if ($hostName.StartsWith('www.')) { $hostName = $hostName.Substring(4) }
+    if ($hostName.Length -eq 0 -or $hostName.Length -gt 253) { return '' }
+    $ip = $null
+    $isIp = [System.Net.IPAddress]::TryParse($hostName, [ref]$ip)
+    if ($hostName -ne 'localhost' -and $hostName.IndexOf('.') -lt 0 -and -not $isIp) { return '' }
+    return $hostName
+  } catch { return '' }
+}
+
+function Get-BrowserSite([string]$ProcessName, [IntPtr]$WindowHandle) {
+  if (-not $CaptureBrowserSites -or $WindowHandle -eq [IntPtr]::Zero) { return '' }
+  $supportedBrowsers = @('chrome', 'msedge', 'brave', 'opera', 'vivaldi', 'firefox')
+  if ($supportedBrowsers -notcontains $ProcessName.ToLowerInvariant()) { return '' }
+
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($WindowHandle)
+    if ($null -eq $root) { return '' }
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Edit
+    )
+    $edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    for ($index = 0; $index -lt $edits.Count; $index++) {
+      $element = $edits.Item($index)
+      $label = $element.Current.Name + ' ' + $element.Current.AutomationId
+      if ($label -notmatch '(?i)(address|omnibox|search bar|地址|搜索栏|网址)') { continue }
+      $pattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+      if ($null -eq $pattern) { continue }
+      $site = Get-SiteHost $pattern.Current.Value
+      if ($site) { return $site }
+    }
+  } catch {}
+  return ''
+}
 
 function Get-IdleMs {
   try {
@@ -97,18 +155,23 @@ while ($true) {
     }
   }
 
+  $site = ''
+  if ($CaptureBrowserSites -and $name) {
+    $site = Get-BrowserSite $name $hwnd
+  }
+
   $appChanged = ($app -ne $lastApp)
   $titleChanged = ($title -ne $lastTitle)
   $sinceFocus = $now - $lastFocusAt
 
   if ($appChanged -or ($titleChanged -and $sinceFocus -ge $TitleThrottleMs)) {
-    Write-Output ('{"k":"f","t":' + $now + ',"app":"' + (Escape-Json $app) + '","name":"' + (Escape-Json $name) + '","title":"' + (Escape-Json $title) + '","pid":' + $procId + ',"i":' + $idle + '}')
+    Write-Output ('{"k":"f","t":' + $now + ',"app":"' + (Escape-Json $app) + '","name":"' + (Escape-Json $name) + '","title":"' + (Escape-Json $title) + '","site":"' + (Escape-Json $site) + '","pid":' + $procId + ',"i":' + $idle + '}')
     $lastApp = $app
     $lastTitle = $title
     $lastFocusAt = $now
     $lastTickAt = $now
   } elseif (($now - $lastTickAt) -ge $TickMs) {
-    Write-Output ('{"k":"t","t":' + $now + ',"i":' + $idle + '}')
+    Write-Output ('{"k":"t","t":' + $now + ',"site":"' + (Escape-Json $site) + '","i":' + $idle + '}')
     $lastTickAt = $now
   }
 

@@ -7,6 +7,7 @@
 //   app_focus  {app, name, title, pid, i}   — foreground app/title changed
 //   tick       {i}                           — periodic activity tick (i = idleMs)
 //   screenshot {file, w, h, bytes, trigger, diff}
+//   site_visit {site, app, name, pid, i}       - opt-in browser hostname only
 //   lock / unlock / resume / suspend
 //   note       {text}                        — user note (future)
 const fs = require('fs');
@@ -288,6 +289,20 @@ class DayStore {
         try { return fs.existsSync(path.join(this.dataDir, e.data.file)); } catch { return false; }
       })
       .map((e) => ({ ts: e.ts, file: e.data.file, w: e.data.w, h: e.data.h, bytes: e.data.bytes, trigger: e.data.trigger, diff: e.data.diff }));
+    const sitesByHost = new Map();
+    for (const e of events) {
+      if (e.kind !== 'site_visit') continue;
+      const site = String(e.data?.site || '').trim().toLowerCase();
+      if (!site || site.length > 253 || /[\s/?#]/.test(site)) continue;
+      const item = sitesByHost.get(site) || {
+        site, visits: 0, firstSeen: e.ts, lastSeen: e.ts, app: e.data?.app || '',
+      };
+      item.visits++;
+      item.lastSeen = e.ts;
+      item.app = e.data?.app || item.app;
+      sitesByHost.set(site, item);
+    }
+    const sites = [...sitesByHost.values()].sort((a, b) => b.lastSeen - a.lastSeen);
     const lockEvents = events.filter((e) => e.kind === 'lock' || e.kind === 'suspend').length;
     // idle summary: count long idle gaps (derived from session gaps)
     let longIdles = 0;
@@ -323,6 +338,7 @@ class DayStore {
       events: events.length,
       ...d,
       screenshots,
+      sites,
       lockEvents,
       longIdles,
       longestIdleMs,

@@ -157,6 +157,7 @@ function dayPayload(dateKey) {
     longIdles: stats.longIdles,
     longestIdleMs: stats.longestIdleMs,
     screenshots: stats.screenshots,
+    sites: stats.sites,
     snapshotBytes: store.daySnapshotBytes(dateKey),
     lockEvents: stats.lockEvents,
   };
@@ -351,6 +352,7 @@ async function runSmokeTests() {
     tmp.append({ ts: base, kind: 'app_focus', data: { app: 'Code', name: 'code', title: 'a.js', pid: 1, i: 1000 } });
     tmp.append({ ts: base + 60000, kind: 'app_focus', data: { app: 'Code', name: 'code', title: 'b.js', pid: 1, i: 2000 } });
     tmp.append({ ts: base + 120000, kind: 'app_focus', data: { app: 'Chrome', name: 'chrome', title: 'x.com', pid: 2, i: 1000 } });
+    tmp.append({ ts: base + 125000, kind: 'site_visit', data: { site: 'example.com', app: 'Chrome', name: 'chrome', pid: 2, i: 1000 } });
     fs.mkdirSync(path.join(smokeDir, 'snapshots', 'x'), { recursive: true });
     fs.writeFileSync(path.join(smokeDir, 'snapshots', 'x', 'y.jpg'), 'test');
     tmp.append({ ts: base + 150000, kind: 'screenshot', data: { file: 'snapshots/x/y.jpg', w: 1600, h: 900, bytes: 100, trigger: 'test', diff: null } });
@@ -363,6 +365,7 @@ async function runSmokeTests() {
     if (stats.apps.length !== 2) throw new Error(`apps=${stats.apps.length}`);
     if (stats.switches !== 1) throw new Error(`switches=${stats.switches}`);
     if (stats.screenshots.length !== 1) throw new Error('screenshots');
+    if (stats.sites.length !== 1 || stats.sites[0].site !== 'example.com' || stats.sites[0].visits !== 1) throw new Error('sites');
     fs.rmSync(smokeDir, { recursive: true, force: true });
   });
 
@@ -428,13 +431,22 @@ async function runSmokeTests() {
     }
   });
 
+  await t('browser site capture is opt-in and host-only', () => {
+    const { DEFAULTS } = require('./settings');
+    const { normalizeSiteHost } = require('./recorder');
+    if (DEFAULTS.recording.browserSites !== false) throw new Error('browser site capture must default to off');
+    if (normalizeSiteHost('https://www.example.com/private?token=secret') !== 'example.com') throw new Error('URL was not reduced to hostname');
+    if (normalizeSiteHost('file:///C:/private.txt') !== '') throw new Error('local file URL was accepted');
+    if (normalizeSiteHost('javascript:alert(1)') !== '') throw new Error('non-web URL was accepted');
+  });
+
   await t('poller ps1 exists outside asar', () => {
     const p = path.join(__dirname, 'ps', 'poller.ps1')
       .replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
     if (!fs.existsSync(p)) throw new Error(`missing: ${p}`);
     if (app.isPackaged && !p.includes('app.asar.unpacked')) throw new Error('packaged poller is still inside asar');
     const s = fs.readFileSync(p, 'utf-8');
-    if (!s.includes('GetForegroundWindow')) throw new Error('bad script');
+    if (!s.includes('GetForegroundWindow') || !s.includes('Get-BrowserSite') || !s.includes('CaptureBrowserSites')) throw new Error('bad script');
   });
 
   console.log(failures.length ? `[Smoke] FAILED: ${failures.join(', ')}` : '[Smoke] all passed');

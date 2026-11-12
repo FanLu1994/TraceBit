@@ -355,6 +355,8 @@ function todayContent(day) {
       </div>
     </div>
 
+    ${sitePanel(day)}
+
     <section class="panel">
       <div class="panel-head">
         <h2 class="panel-title">屏幕快照</h2>
@@ -499,6 +501,29 @@ function aiPanel() {
     </section>`;
 }
 
+function sitePanel(day) {
+  const sites = day.sites || [];
+  const enabled = Boolean(state.settings?.recording?.browserSites);
+  if (!enabled && !sites.length) return '';
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">浏览网站</h2>
+        <span class="panel-hint">仅记录当前浏览器的域名，本机保存</span>
+        <div class="panel-actions"><span class="panel-hint">${sites.length} 个网站</span></div>
+      </div>
+      ${sites.length ? `<div class="site-list">${sites.slice(0, 20).map((item) => `
+        <div class="site-row">
+          <div class="site-main">
+            <div class="site-name">${esc(item.site)}</div>
+            <div class="site-app">${esc(item.app || '浏览器')}</div>
+          </div>
+          <span class="site-visits">${item.visits} 次记录</span>
+          <time class="site-time">${hhmm(item.lastSeen)}</time>
+        </div>`).join('')}</div>` : '<div class="empty-row">还没有读取到网站。请让支持的浏览器窗口保持在前台，稍后刷新。</div>'}
+    </section>`;
+}
+
 function snapshotsHTML(day) {
   state.lightboxShots = day.screenshots.slice().reverse();
   if (!state.lightboxShots.length) return '<div class="empty-snapshots">还没有快照。只有画面发生变化时才会保存，不会持续录屏。</div>';
@@ -571,7 +596,7 @@ function reportAISetup() {
       </div>
     </section>
     <section class="panel setup-panel">
-      <div class="panel-body privacy-note">发送给模型的内容：活跃时长、应用切换、应用名和脱敏后的窗口标题。<br>不会发送：屏幕快照、API Key、键盘输入内容。涉及敏感标题时，建议使用本地模型。</section>
+      <div class="panel-body privacy-note">发送给模型的内容：活跃时长、应用切换、应用名和脱敏后的窗口标题。<br>不会发送：屏幕快照、浏览网站域名、API Key、键盘输入内容。涉及敏感标题时，建议使用本地模型。</section>
     </section>`;
 }
 
@@ -675,6 +700,7 @@ function renderSettings() {
         <div class="settings-block">
           ${settingRow('启用行为记录', '与左侧“开始记录 / 暂停记录”保持同步', switchHTML('rec-enabled', rec.enabled, rec.enabled ? '已开启' : '已暂停'))}
           ${settingRow('保存屏幕快照', '只在应用切换、定时心跳且画面变化时保存', switchHTML('rec-shots', rec.screenshots, rec.screenshots ? '已开启' : '已关闭'))}
+          ${settingRow('记录浏览网站', '默认关闭。仅在本机保存当前浏览器域名，不含路径和查询参数；屏幕快照由上方开关单独控制', switchHTML('rec-sites', rec.browserSites, rec.browserSites ? '已开启' : '已关闭'))}
           ${settingRow('快照心跳间隔', '活跃期间定时检查画面，单位：分钟', '<input type="number" id="rec-heartbeat" min="1" max="60" value="' + Math.round(rec.heartbeatMs / 60000) + '">')}
           ${settingRow('空闲阈值', '无键鼠输入超过该时间后，不计入活跃时长', '<input type="number" id="rec-idle" min="1" max="30" value="' + Math.round(rec.idleThresholdMs / 60000) + '"><span class="switch-label">分钟</span>')}
         </div>
@@ -722,7 +748,7 @@ function wireSettings() {
     input.addEventListener('change', () => { state.settingsDirty = true; });
     input.addEventListener('input', () => { state.settingsDirty = true; });
   });
-  [['#rec-enabled', '已开启', '已暂停'], ['#rec-shots', '已开启', '已关闭']].forEach(([selector, onText, offText]) => {
+  [['#rec-enabled', '已开启', '已暂停'], ['#rec-shots', '已开启', '已关闭'], ['#rec-sites', '已开启', '已关闭']].forEach(([selector, onText, offText]) => {
     $(selector).addEventListener('change', (event) => {
       const label = $('.switch-label', event.target.closest('.setting-control'));
       if (label) label.textContent = event.target.checked ? onText : offText;
@@ -758,6 +784,7 @@ async function saveSettings(silent) {
       recording: {
         enabled: $('#rec-enabled').checked,
         screenshots: $('#rec-shots').checked,
+        browserSites: $('#rec-sites').checked,
         heartbeatMs: Math.max(60000, (parseFloat($('#rec-heartbeat').value) || 5) * 60000),
         idleThresholdMs: Math.max(30000, (parseFloat($('#rec-idle').value) || 1) * 60000),
       },
