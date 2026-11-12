@@ -35,6 +35,9 @@ const DEFAULTS = {
     model: '',
     autoReport: false,      // auto-generate daily report
     autoReportTime: '21:30',
+    webSearch: false,       // opt-in abstract resource searches
+    searchProvider: 'duckduckgo',
+    searchApiKey: '',       // only used for Brave Search, never the AI key
   },
   app: {
     autostart: false,

@@ -386,6 +386,98 @@ async function runSmokeTests() {
     if (!skel.categories.length) throw new Error('no categories');
   });
 
+  await t('local resource recommendations are evidence-based', () => {
+    const { DEFAULTS } = require('./settings');
+    const { buildRecommendations, recommendationsMarkdown } = require('./recommendations');
+    const { assertAbstractQuery } = require('./web-search');
+    const stays = [];
+    let ts = Date.now();
+    const add = (name, app, title, minutes = 3) => {
+      stays.push({ name, app, title, start: ts, end: ts + minutes * 60000 });
+      ts += minutes * 60000;
+    };
+    for (let i = 0; i < 4; i++) {
+      add('code', 'VS Code', 'git commit - project');
+      add('powershell', 'PowerShell', 'git status');
+    }
+    for (let i = 0; i < 3; i++) {
+      add('chrome', 'Chrome', 'research');
+      add('obsidian', 'Obsidian', 'notes');
+    }
+    add('zoom', 'Zoom', 'Zoom Meeting', 40);
+    const apps = [
+      { name: 'code', app: 'VS Code', titles: new Map([['secret@example.com git commit', 3]]) },
+      { name: 'chrome', app: 'Chrome', titles: new Map([['research', 3]]) },
+    ];
+    const recommendations = buildRecommendations({ stays, apps });
+    if (DEFAULTS.ai.webSearch !== false) throw new Error('web search must default to off');
+    if (!recommendations.some((item) => item.id === 'development-loop')) throw new Error('development loop missing');
+    if (!recommendations.some((item) => item.id === 'research-loop')) throw new Error('research loop missing');
+    if (!recommendations.some((item) => item.id === 'meeting-notes')) throw new Error('meeting opportunity missing');
+    for (const item of recommendations) {
+      if (!/\d/.test(item.evidence)) throw new Error('recommendation lacks numeric evidence');
+      if (!item.resources.every((resource) => resource.url.startsWith('https://') && resource.permissions)) throw new Error('resource metadata incomplete');
+    }
+    const markdown = recommendationsMarkdown(recommendations, { enabled: false });
+    if (!markdown.includes('## 六、可工具化的操作') || !markdown.includes('官方') && !markdown.includes('github.com')) throw new Error('recommendation section missing');
+    if (markdown.includes('secret@example.com')) throw new Error('raw title leaked into recommendations');
+    if (assertAbstractQuery('open source Git GUI Windows') !== 'open source Git GUI Windows') throw new Error('abstract query rejected');
+    let rejected = false;
+    try { assertAbstractQuery('https://private.example.com/secret'); } catch { rejected = true; }
+    if (!rejected) throw new Error('raw URL accepted as search query');
+  });
+
+  await t('web search contract, sanitization and local fallback', async () => {
+    const http = require('http');
+    const { searchWeb, enrichRecommendations, parseDuckDuckGo, normalizeHttpUrl, allowedDiscovery } = require('./web-search');
+    const { buildRecommendations } = require('./recommendations');
+    let requestedUrl = '';
+    let receivedKey = '';
+    const server = http.createServer((req, res) => {
+      requestedUrl = req.url;
+      receivedKey = req.headers['x-subscription-token'];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ web: { results: [
+        { title: '<b>Example OSS</b>', url: 'https://github.com/example/oss?utm_source=test', description: 'Example [tool]' },
+        { title: 'Unsafe', url: 'javascript:alert(1)', description: '' },
+      ] } }));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const endpoint = `http://127.0.0.1:${server.address().port}/search`;
+      const results = await searchWeb('open source Git GUI Windows', { provider: 'brave', searchApiKey: 'mock-search-key', searchEndpoint: endpoint });
+      if (!requestedUrl.includes('open+source+Git+GUI+Windows') && !requestedUrl.includes('open%20source%20Git%20GUI%20Windows')) throw new Error(`unexpected query: ${requestedUrl}`);
+      if (receivedKey !== 'mock-search-key') throw new Error('search key was not sent to the selected provider');
+      if (results.length !== 1 || results[0].url !== 'https://github.com/example/oss') throw new Error('search result sanitization failed');
+      if (normalizeHttpUrl('https://user:pass@github.com/example/oss') !== 'https://github.com/example/oss') throw new Error('URL userinfo was not removed');
+      if (allowedDiscovery('http://github.com/example/oss')) throw new Error('insecure discovery URL was accepted');
+      const parsed = parseDuckDuckGo('<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fexample%2Foss">Example &amp; OSS</a>');
+      if (parsed.length !== 1 || parsed[0].url !== 'https://github.com/example/oss') throw new Error('DuckDuckGo parsing failed');
+
+      const stays = [];
+      let ts = Date.now();
+      for (let i = 0; i < 4; i++) {
+        stays.push({ name: 'code', app: 'VS Code', title: 'git commit', start: ts, end: ts + 60000 });
+        stays.push({ name: 'powershell', app: 'PowerShell', title: 'git status', start: ts + 60000, end: ts + 120000 });
+        ts += 120000;
+      }
+      const local = buildRecommendations({ stays, apps: [{ name: 'code', app: 'VS Code', titles: new Map([['git commit', 2]]) }] });
+      let abstractQuery = '';
+      const enriched = await enrichRecommendations(local, { webSearch: true, searchProvider: 'duckduckgo', verifySources: false }, {
+        searchImpl: async (query) => {
+          abstractQuery = query;
+          return [{ title: 'Example Candidate', url: 'https://github.com/example/candidate', description: 'Candidate' }];
+        },
+      });
+      if (abstractQuery !== local[0].searchQuery) throw new Error('search query was not the static opportunity query');
+      if (enriched.search.added !== 1 || enriched.recommendations[0].resources.at(-1).type !== '联网候选') throw new Error('online candidate was not added');
+      const fallback = await enrichRecommendations(local, { webSearch: true, searchProvider: 'brave', searchApiKey: '', verifySources: false });
+      if (!fallback.search.errors.length || fallback.recommendations[0].resources.length !== local[0].resources.length) throw new Error('local fallback failed');
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   await t('AI report end-to-end with local mock', async () => {
     const http = require('http');
     const aiDataDir = path.join(app.getPath('userData'), 'smoke-ai-data');
@@ -395,8 +487,19 @@ async function runSmokeTests() {
     const day = new DayStore(aiDataDir);
     const noon = new Date().setHours(12, 0, 0, 0);
     const dateKey = localDateKey(noon);
-    day.append({ ts: noon, kind: 'app_focus', data: { app: 'VS Code', name: 'code', title: 'secret@example.com - project', pid: 1, i: 1000 } });
-    day.append({ ts: noon + 120000, kind: 'tick', data: { i: 1000 } });
+    const appSequence = ['code', 'powershell', 'code', 'powershell', 'code', 'powershell', 'code', 'powershell'];
+    appSequence.forEach((name, index) => {
+      day.append({
+        ts: noon + index * 60000,
+        kind: 'app_focus',
+        data: {
+          app: name === 'code' ? 'VS Code' : 'PowerShell', name,
+          title: name === 'code' ? 'secret@example.com - git commit' : 'git status',
+          pid: name === 'code' ? 1 : 2, i: 1000,
+        },
+      });
+    });
+    day.append({ ts: noon + appSequence.length * 60000, kind: 'tick', data: { i: 1000 } });
 
     let requestBody = '';
     const server = http.createServer((req, res) => {
@@ -423,6 +526,8 @@ async function runSmokeTests() {
       if (requestBody.includes('secret@example.com')) throw new Error('email was not redacted');
       if (!requestBody.includes('[邮箱]')) throw new Error('redaction marker missing');
       if (!mockAnalyzer.getReport(dateKey)) throw new Error('report not persisted');
+      if (!Array.isArray(report.recommendations) || report.resourceSearch?.enabled !== false) throw new Error('resource metadata missing or search enabled unexpectedly');
+      if (report.recommendationCount !== 1 || !report.markdown.includes('## 六、可工具化的操作') || !report.markdown.includes('lazygit')) throw new Error('recommendations were not integrated into the report');
     } finally {
       settings.data.ai = previousAI;
       await new Promise((resolve) => server.close(resolve));

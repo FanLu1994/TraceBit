@@ -4,6 +4,8 @@
 const fs = require('fs');
 const path = require('path');
 const { categorize, isMeeting, CATEGORY_COLORS } = require('./categories');
+const { buildRecommendations, recommendationsMarkdown } = require('./recommendations');
+const { enrichRecommendations } = require('./web-search');
 
 const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 
@@ -273,19 +275,28 @@ ${skeletonMarkdown(skeleton)}
 
 请依据以上数据写出这一天的行为日报。`;
 
-    const { text, model } = await chatCompletion(ai, [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: userPrompt },
+    const [completion, resourceResult] = await Promise.all([
+      chatCompletion(ai, [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt },
+      ]),
+      enrichRecommendations(buildRecommendations(stats), ai),
     ]);
+    const { text, model } = completion;
+    const { recommendations, search } = resourceResult;
+    const toolMarkdown = recommendationsMarkdown(recommendations, search);
 
     const report = {
       dateKey,
-      markdown: text,
+      markdown: toolMarkdown ? `${text}\n\n${toolMarkdown}` : text,
       model,
       generatedAt: Date.now(),
       activeMinutes: Math.round(stats.totalActiveMs / 60000),
       switchCount: stats.switches,
       appCount: stats.apps.length,
+      recommendationCount: recommendations.length,
+      recommendations,
+      resourceSearch: search,
     };
     fs.writeFileSync(this.reportFile(dateKey), JSON.stringify(report, null, 2), 'utf-8');
     return report;

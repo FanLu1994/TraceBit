@@ -596,7 +596,7 @@ function reportAISetup() {
       </div>
     </section>
     <section class="panel setup-panel">
-      <div class="panel-body privacy-note">发送给模型的内容：活跃时长、应用切换、应用名和脱敏后的窗口标题。<br>不会发送：屏幕快照、浏览网站域名、API Key、键盘输入内容。涉及敏感标题时，建议使用本地模型。</section>
+      <div class="panel-body privacy-note">发送给模型的内容：活跃时长、应用切换、应用名和脱敏后的窗口标题。<br>不会发送：屏幕快照、浏览网站域名、API Key、键盘输入内容。涉及敏感标题时，建议使用本地模型。<br>主动开启联网资源搜索后，搜索服务只接收抽象工具关键词，不接收上述行为记录。</section>
     </section>`;
 }
 
@@ -611,7 +611,7 @@ function reportContentHTML(report) {
     return `<div class="empty-state"><h2>还没有这一天的日报</h2><p>点击右上角“生成日报”。TraceBit 会先在本机整理和脱敏数据，再把统计发送给你配置的模型。</p></div>`;
   }
   return `
-    <div class="report-meta"><span>生成于 ${new Date(report.generatedAt).toLocaleString('zh-CN')}</span><span>模型 ${esc(report.model || '未知')}</span><span>活跃 ${report.activeMinutes ?? '未知'} 分钟</span></div>
+    <div class="report-meta"><span>生成于 ${new Date(report.generatedAt).toLocaleString('zh-CN')}</span><span>模型 ${esc(report.model || '未知')}</span><span>活跃 ${report.activeMinutes ?? '未知'} 分钟</span>${report.recommendationCount ? `<span>工具化机会 ${report.recommendationCount} 项</span><span>${report.resourceSearch?.enabled ? '含联网资源检索' : '本地精选资源'}</span>` : ''}</div>
     <article class="report-document md">${renderMarkdown(report.markdown)}</article>`;
 }
 
@@ -713,6 +713,9 @@ function renderSettings() {
           ${settingRow('API Key', '本地 Ollama 可以留空', `<input type="password" id="ai-key" value="${esc(ai.apiKey)}" placeholder="sk-…">`)}
           ${settingRow('模型名', '例如 deepseek-chat、qwen-plus、gpt-4o-mini', `<input type="text" id="ai-model" value="${esc(ai.model)}" placeholder="deepseek-chat">`)}
           ${settingRow('每日自动生成', '到点分析当天记录并发送系统通知', `${switchHTML('ai-auto', ai.autoReport)}<input type="time" id="ai-auto-time" value="${esc(ai.autoReportTime)}">`)}
+          ${settingRow('联网搜索效率资源', '默认关闭。仅用抽象工具关键词搜索开源项目、Skill 和 MCP，不发送行为记录', switchHTML('ai-web-search', ai.webSearch, ai.webSearch ? '已开启' : '已关闭'))}
+          ${settingRow('搜索服务', 'DuckDuckGo 无需密钥；Brave Search 需要单独的 API Key', `<select id="ai-search-provider"><option value="duckduckgo" ${ai.searchProvider !== 'brave' ? 'selected' : ''}>DuckDuckGo</option><option value="brave" ${ai.searchProvider === 'brave' ? 'selected' : ''}>Brave Search</option></select>`)}
+          ${settingRow('搜索 API Key', '仅 Brave Search 需要，与 AI 接口密钥分开保存', `<input type="password" id="ai-search-key" value="${esc(ai.searchApiKey || '')}" placeholder="使用 DuckDuckGo 时可留空">`)}
           ${settingRow('连接检查', '先保存当前设置，再发送一条极短测试消息', '<button class="button secondary" id="ai-test">保存并测试连接</button><span id="ai-test-result" class="inline-result"></span>')}
         </div>
       </section>
@@ -748,7 +751,7 @@ function wireSettings() {
     input.addEventListener('change', () => { state.settingsDirty = true; });
     input.addEventListener('input', () => { state.settingsDirty = true; });
   });
-  [['#rec-enabled', '已开启', '已暂停'], ['#rec-shots', '已开启', '已关闭'], ['#rec-sites', '已开启', '已关闭']].forEach(([selector, onText, offText]) => {
+  [['#rec-enabled', '已开启', '已暂停'], ['#rec-shots', '已开启', '已关闭'], ['#rec-sites', '已开启', '已关闭'], ['#ai-web-search', '已开启', '已关闭']].forEach(([selector, onText, offText]) => {
     $(selector).addEventListener('change', (event) => {
       const label = $('.switch-label', event.target.closest('.setting-control'));
       if (label) label.textContent = event.target.checked ? onText : offText;
@@ -799,6 +802,9 @@ async function saveSettings(silent) {
         model: $('#ai-model').value.trim(),
         autoReport: $('#ai-auto').checked,
         autoReportTime: $('#ai-auto-time').value || '21:30',
+        webSearch: $('#ai-web-search').checked,
+        searchProvider: $('#ai-search-provider').value,
+        searchApiKey: $('#ai-search-key').value.trim(),
       },
       app: { autostart: $('#app-autostart').checked },
     };

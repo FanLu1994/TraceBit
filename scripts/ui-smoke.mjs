@@ -22,6 +22,16 @@ const mockServer = http.createServer((request, response) => {
 });
 await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
 const mockBaseURL = `http://127.0.0.1:${mockServer.address().port}/v1`;
+const sampleReportMarkdown = [
+  '# 今日行为日报', '', '## 一、今日概览', '活跃 95 分钟。', '',
+  '## 六、可工具化的操作', '',
+  '> 以下来自本地行为规则和内置精选资源，未进行联网搜索。', '',
+  '### 把开发命令收成固定入口',
+  '- 操作依据：编辑器与终端之间切换 8 次，相关应用活跃 42 分钟。',
+  '- 优化方向：先固化重复的项目命令；如果切换主要来自 Git 操作，再使用可视化 Git 工具。',
+  '- [lazygit](https://github.com/jesseduffield/lazygit)（开源项目）：集中处理常见 Git 操作。预期收益：减少命令重复。配置成本：中。权限与隐私：会读写 Git 仓库，破坏性操作前仍需确认和备份。来源状态：内置精选，未联网复核。',
+  '', '以上资源只供人工评估，TraceBit 不会自动下载、安装或启用。',
+].join('\n');
 
 const env = { ...process.env };
 delete env.ELECTRON_RUN_AS_NODE;
@@ -124,8 +134,18 @@ try {
   await waitFor(() => evaluate(`state.settings.recording.browserSites === true && document.querySelector('#save-status').textContent === '已保存'`), 'browser site opt-in save');
   assert(await evaluate(`window.tracebit.getState().then(s => s.settings.recording.browserSites === true)`), 'Browser site opt-in was not persisted');
   assert(await evaluate(`document.querySelector('#rec-sites').closest('.setting-control').querySelector('.switch-label').textContent === '已开启'`), 'Browser site switch label did not update');
+  assert(await evaluate(`state.settings.ai.webSearch === false && document.querySelector('#ai-web-search').checked === false`), 'Resource web search should start off');
+  await evaluate(`(()=>{document.querySelector('#ai-web-search').click();document.querySelector('#save-settings').click()})()`);
+  await waitFor(() => evaluate(`state.settings.ai.webSearch === true && document.querySelector('#save-status').textContent === '已保存'`), 'resource web search opt-in save');
+  assert(await evaluate(`window.tracebit.getState().then(s => s.settings.ai.webSearch === true)`), 'Resource web search opt-in was not persisted');
+  assert(await evaluate(`document.querySelector('#ai-search-provider').value === 'duckduckgo'`), 'Default resource search provider changed unexpectedly');
+  await sleep(400);
+  assert(await evaluate(`state.status.pollerAlive === true && !state.status.lastError`), 'Settings restart surfaced a stale poller exit');
   await evaluate(`document.querySelector('#toasts').innerHTML = ''`);
   await screenshot('settings-1240.png');
+  await evaluate(`document.querySelector('#ai-web-search').scrollIntoView({block:'center'})`);
+  await screenshot('settings-search-1240.png');
+  await evaluate(`document.querySelector('#view').scrollTop = 0`);
 
   await evaluate(`setView('report')`);
   await waitFor(() => evaluate(`Boolean(document.querySelector('#report-ai-base'))`), 'inline AI setup');
@@ -134,6 +154,12 @@ try {
   await evaluate(`(()=>{document.querySelector('#report-ai-base').value=${JSON.stringify(mockBaseURL)};document.querySelector('#report-ai-key').value='ui-mock-key';document.querySelector('#report-ai-model').value='ui-mock-model';document.querySelector('#report-ai-save').click()})()`);
   await waitFor(() => evaluate(`state.settings.ai.model === 'ui-mock-model' && Boolean(document.querySelector('[data-action="generate-report"]'))`), 'inline AI save/test flow');
   assert(await evaluate(`window.tracebit.getState().then(s => s.settings.ai.model === 'ui-mock-model')`), 'Inline AI setup was not persisted');
+  await evaluate(`(async()=>{state.report={dateKey:state.dateKey,generatedAt:Date.now(),model:'ui-mock-model',activeMinutes:95,recommendationCount:1,resourceSearch:{enabled:false},markdown:${JSON.stringify(sampleReportMarkdown)}};state.day={...state.day,exists:true,totalActiveMs:5700000};await renderReport()})()`);
+  await waitFor(() => evaluate(`document.querySelector('.report-document h3')?.textContent === '把开发命令收成固定入口'`), 'recommendation report render');
+  assert(await evaluate(`document.querySelector('.report-document a')?.href === 'https://github.com/jesseduffield/lazygit'`), 'Recommendation source link did not render');
+  await evaluate(`document.querySelector('.report-document h3').scrollIntoView({block:'start'})`);
+  await screenshot('report-recommendations-1240.png');
+  await evaluate(`document.querySelector('#view').scrollTop = 0`);
 
   await evaluate(`setView('today')`);
   await waitFor(() => evaluate(`Boolean(document.querySelector('.status-strip'))`), 'today render');
@@ -151,6 +177,11 @@ try {
   await sleep(200);
   assert(await evaluate(`document.querySelector('#view').scrollWidth <= document.querySelector('#view').clientWidth + 1`), 'Settings view overflows horizontally at 960px');
   await screenshot('settings-960.png');
+  await evaluate(`setView('report')`);
+  await sleep(200);
+  assert(await evaluate(`document.querySelector('#view').scrollWidth <= document.querySelector('#view').clientWidth + 1`), 'Recommendation report overflows horizontally at 960px');
+  await evaluate(`document.querySelector('.report-document h3').scrollIntoView({block:'start'})`);
+  await screenshot('report-recommendations-960.png');
   assert(consoleErrors.length === 0, `Renderer exceptions: ${JSON.stringify(consoleErrors)}`);
 
   console.log('UI smoke passed');
@@ -158,8 +189,11 @@ try {
   console.log('  ✓ primary action has explicit start/pause labels');
   console.log('  ✓ browser site recording defaults off and persists explicit opt-in');
   console.log('  ✓ recorded browser domains render in today view');
+  console.log('  ✓ resource web search defaults off and persists explicit opt-in');
+  console.log('  ✓ settings restarts ignore stale poller exits');
   console.log('  ✓ unconfigured AI report offers inline setup');
   console.log('  ✓ inline AI save/test reaches a configured report page');
+  console.log('  ✓ recommendation evidence, source links, and permissions render in reports');
   console.log('  ✓ today and settings fit 1240px and 960px viewports');
   console.log(`  screenshots: ${artifacts}`);
 } catch (error) {

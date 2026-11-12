@@ -174,11 +174,13 @@ class Recorder {
       if (s) console.error('[Recorder] poller stderr:', s.slice(0, 300));
     });
     child.on('error', (err) => {
+      if (this.poller !== child) return;
       this.lastError = `无法启动轮询进程：${err.message}`;
       console.error('[Recorder] poller spawn error:', err.message);
       this.emitStatus();
     });
     child.on('exit', (code) => {
+      if (this.poller !== child) return;
       this.poller = null;
       if (!this.running) return;
       this.pollerFailures++;
