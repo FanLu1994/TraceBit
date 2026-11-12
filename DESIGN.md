@@ -32,11 +32,12 @@ A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber
 - Status summary is one open strip with generous whitespace and a bottom divider, not separate metric cards.
 - Navigation uses text and consistent 18px line icons. Selected state is a pale amber wash.
 - Inputs have visible labels and inline action feedback. Settings save is sticky and explicit.
+- Interval summaries are a separate Today section, newest first, with time range, image count, plain-text summary, and inline failure feedback.
 
 ## 5. Layout
 - 184px navigation rail, flexible workspace.
 - 28px page gutter, 20px section spacing.
-- Today: open status strip, unframed 24-hour timeline, two-column application/category area, snapshots. Use panels only for empty states, self-contained forms, and report documents.
+- Today: open status strip, unframed 24-hour timeline, two-column application/category area, optional interval summaries, sites, and snapshots. Use panels only for empty states, self-contained forms, and report documents.
 - Collapse the two-column area below 1100px.
 - Minimum supported window: 960×620. Every target remains at least 40px high.
 
@@ -53,19 +54,33 @@ A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber
 - Do not wrap every data region in an identical rounded card.
 - Do not use tinted success/error boxes or slogans as section subtitles.
 - Do not make the user save a form just to start or pause recording.
+- Keep daily reports text-only. Screenshot interval analysis is a separate opt-in requiring a vision-capable model; never upload a historical backlog after first enablement.
+- Limit interval analysis to 6 evenly spaced snapshots, downscaled to a 1024px long edge and re-encoded as JPEG.
 
-## 8. Motion
+## 8. Native Windows behavior
+- Keep the Rust/GPUI native stack. Use the real title bar, Windows notifications, and an owner-bound native warning dialog for destructive actions.
+- Use the arrow cursor on buttons, navigation, list rows, and thumbnails. Reserve the hand cursor for content links and the I-beam for editable text.
+- Tab / Shift-Tab moves through controls; Enter / Space activates the focused control. Focus uses a visible amber outline without changing layout.
+- Escape closes the snapshot viewer or dismisses inline feedback.
+- Shortcuts: Ctrl+1 Today, Ctrl+2 Report, Ctrl+3 or Ctrl+, Settings, Ctrl+Shift+R toggle recording, Ctrl+W close window.
+- A second launch restores and focuses the existing window.
+- The snapshot viewer has a header, a viewport-bounded image area, and a footer toolbar. It must not overflow at the minimum window size.
+
+## 9. Motion
 - Press feedback: scale to 0.98 in 120ms.
 - Hover color changes: 120ms.
 - Toasts: opacity and small translate, 160ms.
 - No layout animation and no `transition: all`.
 - Respect `prefers-reduced-motion`.
 
-## 9. Verification
+## 10. Verification
 - Check 1240×840 and 960×620 in the native GPUI window.
 - Check today with sparse data, empty day, recording active and paused.
 - Check report unconfigured, generating, generated and error states.
+- Check interval analysis opt-in, first-interval waiting, sparse screenshots, vision-model errors, cross-midnight intervals, and summary persistence.
 - Check settings save and global toggle remain synchronized.
 - Check long window titles and long input values do not overflow their containers.
 - Check titlebar, taskbar and tray icons, plus close-to-tray restoration.
+- Check the snapshot viewer at both window sizes, including long metadata, first/last image, Escape, and keyboard activation.
+- Check Tab / Shift-Tab, Enter / Space, global shortcuts, destructive confirmations, and second-launch window restoration.
 - Run `cargo test` and `cargo run -- --native-smoke` after collector changes.

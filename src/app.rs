@@ -1,6 +1,7 @@
 use crate::{
     analyzer::{Analyzer, Report, ReportSummary},
     input::{self, TextInput},
+    intervals::{IntervalAnalyzer, IntervalSummary},
     platform,
     recorder::{Recorder, RecorderStatus},
     settings::{Settings, SettingsData},
@@ -9,9 +10,9 @@ use crate::{
 use anyhow::Result;
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone};
 use gpui::{
-    App, Application, Bounds, Context, Div, ElementId, Entity, FontWeight, SharedString, Stateful,
-    Timer, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, prelude::*, px,
-    relative, rgb, rgba, size,
+    App, Application, Bounds, Context, Div, ElementId, Entity, FocusHandle, FontWeight, KeyBinding,
+    SharedString, Stateful, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
+    div, img, prelude::*, px, relative, rgb, rgba, size,
 };
 use std::{
     collections::BTreeMap,
@@ -38,8 +39,23 @@ const SECONDARY: u32 = 0x565e65;
 const FAINT: u32 = 0x747c83;
 const DIVIDER: u32 = 0xd7dde1;
 const BRAND_PALE: u32 = 0xf6ecd7;
+const ACCENT: u32 = 0xc88918;
 const GREEN: u32 = 0x2f7d57;
 const RED: u32 = 0xb64b4b;
+
+actions!(
+    tracebit,
+    [
+        ShowToday,
+        ShowReport,
+        ShowSettings,
+        ToggleRecording,
+        Dismiss,
+        CloseWindow,
+        FocusNext,
+        FocusPrevious
+    ]
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -59,6 +75,7 @@ struct FormState {
     api_key: Entity<TextInput>,
     model: Entity<TextInput>,
     auto_time: Entity<TextInput>,
+    screenshot_interval: Entity<TextInput>,
     search_key: Entity<TextInput>,
     heartbeat: Entity<TextInput>,
     idle: Entity<TextInput>,
@@ -88,6 +105,12 @@ impl FormState {
             ),
             model: input(cx, settings.ai.model.clone(), "deepseek-chat", false),
             auto_time: input(cx, settings.ai.auto_report_time.clone(), "21:30", false),
+            screenshot_interval: input(
+                cx,
+                (settings.ai.screenshot_analysis_interval_ms / 60_000).to_string(),
+                "30",
+                false,
+            ),
             search_key: input(
                 cx,
                 settings.ai.search_api_key.clone(),
@@ -140,6 +163,11 @@ impl FormState {
                 "21:30".to_owned()
             }
         };
+        draft.ai.screenshot_analysis_interval_ms = value(&self.screenshot_interval)
+            .parse::<u64>()
+            .unwrap_or(30)
+            .clamp(5, 240)
+            * 60_000;
         draft.ai.search_api_key = value(&self.search_key).trim().to_owned();
         draft.recording.heartbeat_ms = (value(&self.heartbeat)
             .parse::<f64>()
@@ -170,15 +198,19 @@ impl FormState {
 }
 
 pub struct TraceBitWindow {
+    focus_handle: FocusHandle,
     settings: Arc<Settings>,
     store: Arc<DayStore>,
     recorder: Recorder,
     analyzer: Arc<Analyzer>,
+    interval_analyzer: Arc<IntervalAnalyzer>,
     view: View,
     date: NaiveDate,
     day: DayStats,
     report: Option<Report>,
     report_list: Vec<ReportSummary>,
+    interval_summaries: Vec<IntervalSummary>,
+    interval_error: Option<String>,
     status: RecorderStatus,
     draft: SettingsData,
     form: FormState,
@@ -190,6 +222,7 @@ pub struct TraceBitWindow {
     report_rx: Option<Receiver<(String, Result<Report>)>>,
     test_rx: Option<Receiver<Result<(String, String)>>>,
     auto_rx: Receiver<String>,
+    interval_rx: Receiver<std::result::Result<String, String>>,
     tray: Option<TrayState>,
     quitting: Arc<AtomicBool>,
 }
@@ -203,7 +236,9 @@ impl TraceBitWindow {
         store: Arc<DayStore>,
         recorder: Recorder,
         analyzer: Arc<Analyzer>,
+        interval_analyzer: Arc<IntervalAnalyzer>,
         auto_rx: Receiver<String>,
+        interval_rx: Receiver<std::result::Result<String, String>>,
         quitting: Arc<AtomicBool>,
     ) -> Self {
         let current = settings.get();
@@ -211,19 +246,26 @@ impl TraceBitWindow {
         let day = load_day(&store, &settings, &local_date_key(now_ms()));
         let report = analyzer.get_report(&local_date_key(now_ms()));
         let report_list = analyzer.list_reports();
+        let interval_summaries = interval_analyzer.list(&local_date_key(now_ms()));
         let status = recorder.status();
         let form = FormState::new(cx, &current);
         let tray = create_tray(status.running && status.enabled);
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle);
         let mut this = Self {
+            focus_handle,
             settings,
             store,
             recorder,
             analyzer,
+            interval_analyzer,
             view: View::Today,
             date,
             day,
             report,
             report_list,
+            interval_summaries,
+            interval_error: None,
             status,
             draft: current,
             form,
@@ -235,6 +277,7 @@ impl TraceBitWindow {
             report_rx: None,
             test_rx: None,
             auto_rx,
+            interval_rx,
             tray,
             quitting,
         };
@@ -267,6 +310,17 @@ impl TraceBitWindow {
                 self.report = self.analyzer.get_report(&date_key);
             }
             self.report_list = self.analyzer.list_reports();
+        }
+        while let Ok(result) = self.interval_rx.try_recv() {
+            match result {
+                Ok(date_key) => {
+                    self.interval_error = None;
+                    if self.date_key() == date_key {
+                        self.interval_summaries = self.interval_analyzer.list(&date_key);
+                    }
+                }
+                Err(error) => self.interval_error = Some(error),
+            }
         }
         if self.view == View::Today
             && self.date == Local::now().date_naive()
@@ -395,6 +449,7 @@ impl TraceBitWindow {
     fn reload_selected(&mut self) {
         self.reload_day();
         self.report = self.analyzer.get_report(&self.date_key());
+        self.interval_summaries = self.interval_analyzer.list(&self.date_key());
         self.report_error = None;
         self.lightbox = None;
     }
@@ -405,6 +460,57 @@ impl TraceBitWindow {
             self.date = next;
             self.reload_selected();
         }
+    }
+
+    fn open_today(&mut self, _: &ShowToday, _: &mut Window, cx: &mut Context<Self>) {
+        self.view = View::Today;
+        self.reload_selected();
+        cx.notify();
+    }
+
+    fn open_report(&mut self, _: &ShowReport, _: &mut Window, cx: &mut Context<Self>) {
+        self.view = View::Report;
+        self.reload_selected();
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, _: &ShowSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.view = View::Settings;
+        cx.notify();
+    }
+
+    fn toggle_recording_from_key(
+        &mut self,
+        _: &ToggleRecording,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_recording();
+        cx.notify();
+    }
+
+    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        if self.lightbox.take().is_some() || self.notice.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _: &mut Context<Self>) {
+        if self.settings.get().app.close_to_tray {
+            platform::set_window_visible(window, false);
+        } else {
+            self.recorder.stop();
+            self.quitting.store(true, Ordering::Release);
+            window.remove_window();
+        }
+    }
+
+    fn focus_next(&mut self, _: &FocusNext, window: &mut Window, _: &mut Context<Self>) {
+        window.focus_next();
+    }
+
+    fn focus_previous(&mut self, _: &FocusPrevious, window: &mut Window, _: &mut Context<Self>) {
+        window.focus_prev();
     }
 
     fn toggle_recording(&mut self) {
@@ -464,6 +570,7 @@ impl TraceBitWindow {
                 } else {
                     self.notice = Some(("设置已保存".to_owned(), true));
                 }
+                self.interval_error = None;
                 if self.draft.recording.enabled {
                     self.recorder.restart();
                 } else {
@@ -493,11 +600,27 @@ impl TraceBitWindow {
         self.notice = Some(("正在测试 AI 连接…".to_owned(), true));
     }
 
-    fn purge(&mut self, screenshots_only: bool) {
+    fn purge(&mut self, window: &Window, screenshots_only: bool) {
+        let (title, message) = if screenshots_only {
+            (
+                "清空屏幕快照",
+                "将删除所有本地屏幕快照，活动记录会保留。此操作无法撤销。",
+            )
+        } else {
+            (
+                "清空全部记录",
+                "将删除所有本地活动记录和屏幕快照。此操作无法撤销。",
+            )
+        };
+        if !platform::confirm_destructive(window, title, message) {
+            return;
+        }
         let result = if screenshots_only {
             self.store.purge_screenshots()
         } else {
-            self.store.purge_all()
+            self.store
+                .purge_all()
+                .and_then(|()| self.interval_analyzer.purge_all())
         };
         match result {
             Ok(()) => {
@@ -791,6 +914,10 @@ impl TraceBitWindow {
                     ),
             )
             .children(
+                (self.draft.ai.screenshot_analysis || !self.interval_summaries.is_empty())
+                    .then(|| self.render_interval_summaries()),
+            )
+            .children(
                 (self.draft.recording.browser_sites || !self.day.sites.is_empty())
                     .then(|| self.render_sites()),
             )
@@ -1075,7 +1202,7 @@ impl TraceBitWindow {
                 } else if configured {
                     "根据当天的应用使用和活跃时长生成日报。".to_owned()
                 } else {
-                    "连接模型后即可生成日报。标题会脱敏，截图不会发送。".to_owned()
+                    "连接模型后即可生成日报；截图分析可在设置中单独开启。".to_owned()
                 },
             ))
             .child(
@@ -1101,6 +1228,52 @@ impl TraceBitWindow {
                     cx.notify();
                 })),
             )
+    }
+
+    fn render_interval_summaries(&self) -> Div {
+        let mut section = section()
+            .gap_3()
+            .child(panel_head("时段摘要", "独立分析截图，不进入 AI 日报"));
+        if let Some(error) = &self.interval_error {
+            section = section.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(RED))
+                    .child(format!("时段分析失败：{error}")),
+            );
+        }
+        section.children(if self.interval_summaries.is_empty() {
+            vec![
+                div()
+                    .text_sm()
+                    .text_color(rgb(SECONDARY))
+                    .child("完成一个分析时段后，摘要会显示在这里。"),
+            ]
+        } else {
+            self.interval_summaries
+                .iter()
+                .rev()
+                .map(|summary| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(rgb(DIVIDER))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .text_xs()
+                                .text_color(rgb(SECONDARY))
+                                .child(format!("{}–{}", hhmm(summary.start), hhmm(summary.end)))
+                                .child(format!("分析 {} 张截图", summary.screenshot_count)),
+                        )
+                        .child(div().text_sm().child(summary.summary.clone()))
+                })
+                .collect()
+        })
     }
 
     fn render_sites(&self) -> Div {
@@ -1176,7 +1349,11 @@ impl TraceBitWindow {
                             .flex_col()
                             .gap_1()
                             .id(SharedString::from(format!("shot-{index}")))
-                            .cursor_pointer()
+                            .tab_index(0)
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(CANVAS))
+                            .focus(|style| style.border_color(rgb(ACCENT)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.lightbox = Some(index);
                                 cx.notify();
@@ -1302,7 +1479,7 @@ impl TraceBitWindow {
             .child(setting_row("API Key", "密钥只保存在本机设置文件中", self.form.api_key.clone()))
             .child(setting_row("模型名", "例如 deepseek-chat、qwen-plus、gpt-4o-mini", self.form.model.clone()))
             .child(button("report-ai-save", if self.testing { "正在测试…" } else { "保存并测试" }, true).on_click(cx.listener(|this, _, _, cx| { this.test_ai(cx); cx.notify(); })))
-            .child(div().text_sm().text_color(rgb(SECONDARY)).child("发送：活跃时长、切换、应用名和脱敏标题。不会发送：截图、网站域名、API Key、键盘输入内容。"))
+            .child(div().text_sm().text_color(rgb(SECONDARY)).child("日报只发送脱敏文本统计，不发送网站域名、API Key 或键盘输入。截图仅在开启“自动分析屏幕截图”后按时段发送。"))
     }
 
     fn render_report_history(&self, cx: &mut Context<Self>) -> Div {
@@ -1320,7 +1497,10 @@ impl TraceBitWindow {
                     .justify_between()
                     .p_3()
                     .rounded_md()
-                    .cursor_pointer()
+                    .tab_index(0)
+                    .border_1()
+                    .border_color(rgb(SURFACE))
+                    .focus(|style| style.border_color(rgb(ACCENT)))
                     .hover(|style| style.bg(rgb(CANVAS)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
@@ -1405,6 +1585,20 @@ impl TraceBitWindow {
                 "模型名",
                 "例如 deepseek-chat、qwen-plus",
                 self.form.model.clone(),
+            ))
+            .child(self.toggle_row(
+                "自动分析屏幕截图",
+                "将该时段截图发送到当前 AI 接口，需视觉模型",
+                self.draft.ai.screenshot_analysis,
+                cx.listener(|this, _, _, cx| {
+                    this.draft.ai.screenshot_analysis = !this.draft.ai.screenshot_analysis;
+                    cx.notify();
+                }),
+            ))
+            .child(setting_row(
+                "截图分析间隔",
+                "5–240 分钟；每次最多 6 张，缩放后发送",
+                self.form.screenshot_interval.clone(),
             ))
             .child(self.toggle_row(
                 "每日自动生成",
@@ -1496,7 +1690,7 @@ impl TraceBitWindow {
                 .gap_4()
                 .child(panel_head(
                     "隐私与存储",
-                    "敏感窗口不截图，快照永远不会发送给 AI",
+                    "敏感窗口不截图；截图分析需单独开启",
                 ))
                 .child(setting_row(
                     "敏感内容关键词",
@@ -1554,14 +1748,14 @@ impl TraceBitWindow {
                             )),
                         )
                         .child(small_button("purge-shots", "清空快照", false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.purge(true);
+                            cx.listener(|this, _, window, cx| {
+                                this.purge(window, true);
                                 cx.notify();
                             }),
                         ))
                         .child(small_button("purge-all", "清空全部记录", false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.purge(false);
+                            cx.listener(|this, _, window, cx| {
+                                this.purge(window, false);
                                 cx.notify();
                             }),
                         )),
@@ -1593,7 +1787,11 @@ impl TraceBitWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .cursor_pointer()
+                    .tab_index(0)
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(SURFACE))
+                    .focus(|style| style.border_color(rgb(ACCENT)))
                     .on_click(on_click)
                     .child(
                         div()
@@ -1619,10 +1817,14 @@ impl TraceBitWindow {
             )
     }
 
-    fn render_lightbox(&self, cx: &mut Context<Self>) -> Option<Div> {
+    fn render_lightbox(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let index = self.lightbox?;
         let shot = self.day.screenshots.get(index)?;
         let path = self.store.snapshot_path(&shot.file)?;
+        let viewport = window.viewport_size();
+        let viewer_width = (viewport.width - px(64.)).max(px(320.)).min(px(1120.));
+        let image_width = (viewer_width - px(32.)).max(px(288.));
+        let image_height = (viewport.height - px(236.)).max(px(160.)).min(px(650.));
         Some(
             div()
                 .absolute()
@@ -1630,39 +1832,79 @@ impl TraceBitWindow {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0x000000cc))
+                .bg(rgba(0x000000b8))
                 .p_8()
                 .child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap_3()
-                        .items_center()
-                        .child(img(path).max_w(px(1000.)).max_h(px(650.)).rounded_lg())
+                        .w(viewer_width)
+                        .bg(rgb(SURFACE))
+                        .border_1()
+                        .border_color(rgb(DIVIDER))
+                        .rounded_lg()
+                        .overflow_hidden()
                         .child(
                             div()
                                 .flex()
-                                .gap_3()
                                 .items_center()
-                                .child(small_button("lightbox-prev", "‹ 上一张", false).on_click(
+                                .justify_between()
+                                .px_4()
+                                .py_3()
+                                .border_b_1()
+                                .border_color(rgb(DIVIDER))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("屏幕快照"),
+                                        )
+                                        .child(div().text_xs().text_color(rgb(SECONDARY)).child(
+                                            format!(
+                                                "{} · {} · {}/{}",
+                                                hhmm(shot.ts),
+                                                trigger_label(&shot.trigger),
+                                                index + 1,
+                                                self.day.screenshots.len()
+                                            ),
+                                        )),
+                                )
+                                .child(small_button("lightbox-close", "关闭", false).on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.move_lightbox(-1);
+                                        this.lightbox = None;
                                         cx.notify();
                                     }),
-                                ))
-                                .child(div().text_sm().text_color(gpui::white()).child(format!(
-                                    "{} · {} · {}/{}",
-                                    hhmm(shot.ts),
-                                    trigger_label(&shot.trigger),
-                                    index + 1,
-                                    self.day.screenshots.len()
-                                )))
-                                .child(small_button("lightbox-next", "下一张 ›", false).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.move_lightbox(1);
-                                        cx.notify();
-                                    }),
-                                ))
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w_full()
+                                .p_4()
+                                .bg(rgb(0x17191b))
+                                .child(
+                                    img(path)
+                                        .max_w(image_width)
+                                        .max_h(image_height)
+                                        .rounded_md(),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_4()
+                                .py_3()
+                                .border_t_1()
+                                .border_color(rgb(DIVIDER))
                                 .child(small_button("lightbox-open", "系统看图", false).on_click(
                                     cx.listener(|this, _, _, _| {
                                         if let Some(shot) = this
@@ -1674,12 +1916,25 @@ impl TraceBitWindow {
                                         }
                                     }),
                                 ))
-                                .child(small_button("lightbox-close", "关闭", true).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.lightbox = None;
-                                        cx.notify();
-                                    }),
-                                )),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            small_button("lightbox-prev", "上一张", false)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.move_lightbox(-1);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            small_button("lightbox-next", "下一张", false)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.move_lightbox(1);
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ),
                         ),
                 ),
         )
@@ -1697,7 +1952,7 @@ impl TraceBitWindow {
 }
 
 impl Render for TraceBitWindow {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.view {
             View::Today => self.render_today(cx),
             View::Report => self.render_report(cx),
@@ -1705,6 +1960,15 @@ impl Render for TraceBitWindow {
         };
         div()
             .relative()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::open_today))
+            .on_action(cx.listener(Self::open_report))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::toggle_recording_from_key))
+            .on_action(cx.listener(Self::dismiss))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_previous))
             .flex()
             .size_full()
             .bg(rgb(CANVAS))
@@ -1721,7 +1985,7 @@ impl Render for TraceBitWindow {
                     .p_7()
                     .child(content),
             )
-            .children(self.render_lightbox(cx))
+            .children(self.render_lightbox(window, cx))
     }
 }
 
@@ -1795,10 +2059,13 @@ fn nav_button(id: impl Into<ElementId>, label: &str, selected: bool) -> Stateful
         .px_3()
         .py_2()
         .rounded_md()
-        .cursor_pointer()
+        .tab_index(0)
         .text_sm()
         .bg(rgb(if selected { BRAND_PALE } else { SURFACE }))
         .text_color(rgb(if selected { INK } else { SECONDARY }))
+        .border_1()
+        .border_color(rgb(if selected { BRAND_PALE } else { SURFACE }))
+        .focus(|style| style.border_color(rgb(ACCENT)))
         .hover(|style| style.bg(rgb(BRAND_PALE)))
         .child(label.to_owned())
 }
@@ -1812,12 +2079,13 @@ fn button(id: impl Into<ElementId>, label: &str, primary: bool) -> Stateful<Div>
         .h(px(40.))
         .px_4()
         .rounded_md()
-        .cursor_pointer()
+        .tab_index(0)
         .text_sm()
         .bg(rgb(if primary { INK } else { SURFACE }))
         .text_color(rgb(if primary { 0xffffff } else { INK }))
         .border_1()
         .border_color(rgb(if primary { INK } else { DIVIDER }))
+        .focus(|style| style.border_color(rgb(ACCENT)))
         .active(|style| style.opacity(0.85))
         .child(label.to_owned())
 }
@@ -1831,11 +2099,12 @@ fn small_button(id: impl Into<ElementId>, label: &str, selected: bool) -> Statef
         .items_center()
         .justify_center()
         .rounded_md()
-        .cursor_pointer()
+        .tab_index(0)
         .text_xs()
         .bg(rgb(if selected { BRAND_PALE } else { SURFACE }))
         .border_1()
         .border_color(rgb(DIVIDER))
+        .focus(|style| style.border_color(rgb(ACCENT)))
         .child(label.to_owned())
 }
 
@@ -1954,7 +2223,9 @@ fn render_markdown_line(index: usize, line: &str) -> Stateful<Div> {
     }
     if let Some(url) = url {
         element = element
+            .tab_index(0)
             .cursor_pointer()
+            .focus(|style| style.bg(rgb(SUBTLE)))
             .text_color(rgb(0x4277a8))
             .on_click(move |_, _, _| {
                 let _ = open::that(&url);
@@ -2061,6 +2332,10 @@ fn report_excerpt(markdown: &str) -> String {
 pub fn run() -> Result<()> {
     #[cfg(windows)]
     let _instance = platform::single_instance()?;
+    #[cfg(windows)]
+    if _instance.is_none() {
+        return Ok(());
+    }
     let user_dir = crate::user_data_dir();
     fs::create_dir_all(&user_dir)?;
     let settings = Arc::new(Settings::load(&user_dir));
@@ -2071,6 +2346,11 @@ pub fn run() -> Result<()> {
         store.clone(),
         user_dir.join("reports"),
     )?);
+    let interval_analyzer = Arc::new(IntervalAnalyzer::new(
+        settings.clone(),
+        store.clone(),
+        user_dir.join("intervals"),
+    )?);
     if settings.get().app.autostart {
         let _ = platform::set_autostart(true);
     }
@@ -2079,10 +2359,23 @@ pub fn run() -> Result<()> {
     }
     let (auto_tx, auto_rx) = std::sync::mpsc::channel();
     spawn_auto_report(settings.clone(), analyzer.clone(), auto_tx);
+    let (interval_tx, interval_rx) = std::sync::mpsc::channel();
+    spawn_interval_analysis(settings.clone(), interval_analyzer.clone(), interval_tx);
     let quitting = Arc::new(AtomicBool::new(false));
     let recorder_for_quit = recorder.clone();
     Application::new().run(move |cx| {
         input::bind_keys(cx);
+        cx.bind_keys([
+            KeyBinding::new("ctrl-1", ShowToday, None),
+            KeyBinding::new("ctrl-2", ShowReport, None),
+            KeyBinding::new("ctrl-3", ShowSettings, None),
+            KeyBinding::new("ctrl-,", ShowSettings, None),
+            KeyBinding::new("ctrl-shift-r", ToggleRecording, None),
+            KeyBinding::new("ctrl-w", CloseWindow, None),
+            KeyBinding::new("escape", Dismiss, None),
+            KeyBinding::new("tab", FocusNext, None),
+            KeyBinding::new("shift-tab", FocusPrevious, None),
+        ]);
         let bounds = Bounds::centered(None, size(px(1240.), px(840.)), cx);
         let settings_for_close = settings.clone();
         let recorder_for_close = recorder.clone();
@@ -2120,7 +2413,9 @@ pub fn run() -> Result<()> {
                         store.clone(),
                         recorder.clone(),
                         analyzer.clone(),
+                        interval_analyzer.clone(),
                         auto_rx,
+                        interval_rx,
                         quitting.clone(),
                     )
                 })
@@ -2166,6 +2461,47 @@ fn spawn_auto_report(
                     let _ = sender.send(date_key);
                 }
                 Err(error) => eprintln!("[AutoReport] {error:#}"),
+            }
+        }
+    });
+}
+
+fn spawn_interval_analysis(
+    settings: Arc<Settings>,
+    analyzer: Arc<IntervalAnalyzer>,
+    sender: std::sync::mpsc::Sender<std::result::Result<String, String>>,
+) {
+    thread::spawn(move || {
+        let mut retry_after = None::<std::time::Instant>;
+        let mut previous_config = String::new();
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            let ai = settings.get().ai;
+            let config = format!(
+                "{}|{}|{}|{}",
+                ai.base_url, ai.model, ai.screenshot_analysis, ai.screenshot_analysis_interval_ms
+            );
+            if config != previous_config {
+                retry_after = None;
+                previous_config = config;
+            }
+            if !ai.screenshot_analysis || ai.base_url.is_empty() || ai.model.is_empty() {
+                continue;
+            }
+            if retry_after.is_some_and(|until| until > std::time::Instant::now()) {
+                continue;
+            }
+            match analyzer.analyze_due(now_ms()) {
+                Ok(Some(summary)) => {
+                    retry_after = None;
+                    let _ = sender.send(Ok(local_date_key(summary.end)));
+                }
+                Ok(None) => retry_after = None,
+                Err(error) => {
+                    eprintln!("[IntervalAnalysis] {error:#}");
+                    let _ = sender.send(Err(format!("{error:#}")));
+                    retry_after = Some(std::time::Instant::now() + Duration::from_secs(900));
+                }
             }
         }
     });

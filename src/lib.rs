@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod app;
 pub mod categories;
 pub mod input;
+pub mod intervals;
 pub mod platform;
 pub mod recommendations;
 pub mod recorder;

@@ -702,6 +702,7 @@ mod tests {
         let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(request.contains("mock-model"));
         assert!(request.contains("Bearer mock-key"));
+        assert!(!request.contains("image_url"));
         assert!(!request.contains("secret@example.com"));
         assert!(request.contains("[邮箱]"));
         assert!(!request.contains("private.example.com"));

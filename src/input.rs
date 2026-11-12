@@ -581,6 +581,7 @@ impl Render for TextInput {
             .id(self.placeholder.clone())
             .key_context("TraceBitInput")
             .track_focus(&self.focus_handle(cx))
+            .tab_index(0)
             .on_click(cx.listener(|this, _, window, cx| {
                 window.focus(&this.focus_handle(cx));
             }))
@@ -610,6 +611,7 @@ impl Render for TextInput {
             .bg(gpui::rgb(0xffffff))
             .border_1()
             .border_color(gpui::rgb(0xd7dde1))
+            .focus(|style| style.border_color(gpui::rgb(0xc88918)))
             .rounded_md()
             .text_sm()
             .child(TextElement { input: cx.entity() })

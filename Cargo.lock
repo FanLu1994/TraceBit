@@ -5811,6 +5811,7 @@ name = "tracebit"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "dirs 6.0.0",
  "embed-resource",

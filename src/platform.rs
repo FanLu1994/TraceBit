@@ -472,14 +472,64 @@ pub fn show_notification(title: &str, body: &str) {
 }
 
 #[cfg(windows)]
-pub fn single_instance() -> anyhow::Result<windows::Win32::Foundation::HANDLE> {
-    use windows::{Win32::System::Threading::CreateMutexW, core::w};
-    let handle = unsafe { CreateMutexW(None, true, w!("Local\\TraceBit.Desktop.SingleInstance"))? };
-    if unsafe { windows::Win32::Foundation::GetLastError() }
-        == windows::Win32::Foundation::ERROR_ALREADY_EXISTS
-    {
-        unsafe { windows::Win32::Foundation::CloseHandle(handle)? };
-        anyhow::bail!("TraceBit 已经在运行");
+pub fn confirm_destructive(window: &gpui::Window, title: &str, message: &str) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::{
+            Foundation::HWND,
+            UI::WindowsAndMessaging::{
+                IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW,
+            },
+        },
+        core::PCWSTR,
+    };
+    let owner = HasWindowHandle::window_handle(window)
+        .ok()
+        .and_then(|handle| match handle.as_ref() {
+            RawWindowHandle::Win32(handle) => {
+                Some(HWND(handle.hwnd.get() as *mut std::ffi::c_void))
+            }
+            _ => None,
+        });
+    let wide = |value: &str| {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let title = wide(title);
+    let message = wide(message);
+    unsafe {
+        MessageBoxW(
+            owner,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES
     }
-    Ok(handle)
+}
+
+#[cfg(windows)]
+pub fn single_instance() -> anyhow::Result<Option<windows::Win32::Foundation::HANDLE>> {
+    use windows::{
+        Win32::{
+            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+            UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow},
+        },
+        core::{PCWSTR, w},
+    };
+    let handle = unsafe { CreateMutexW(None, true, w!("Local\\TraceBit.Desktop.SingleInstance"))? };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), w!("TraceBit")) } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+        unsafe { CloseHandle(handle)? };
+        return Ok(None);
+    }
+    Ok(Some(handle))
 }

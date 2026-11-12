@@ -114,6 +114,8 @@ pub struct AiSettings {
     pub model: String,
     pub auto_report: bool,
     pub auto_report_time: String,
+    pub screenshot_analysis: bool,
+    pub screenshot_analysis_interval_ms: u64,
     pub web_search: bool,
     pub search_provider: String,
     pub search_api_key: String,
@@ -131,6 +133,8 @@ impl Default for AiSettings {
             model: String::new(),
             auto_report: false,
             auto_report_time: "21:30".to_owned(),
+            screenshot_analysis: false,
+            screenshot_analysis_interval_ms: 30 * 60_000,
             web_search: false,
             search_provider: "duckduckgo".to_owned(),
             search_api_key: String::new(),
@@ -242,6 +246,8 @@ mod tests {
         assert!(!settings.recording.browser_sites);
         assert!(!settings.ai.web_search);
         assert!(!settings.ai.auto_report);
+        assert!(!settings.ai.screenshot_analysis);
+        assert_eq!(settings.ai.screenshot_analysis_interval_ms, 30 * 60_000);
         assert_eq!(settings.storage.max_snapshot_bytes, 2 * 1024 * 1024 * 1024);
     }
 
