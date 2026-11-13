@@ -1506,14 +1506,14 @@ impl TraceBitWindow {
                         .flex()
                         .gap_2()
                         .child(
-                            small_button(
+                            button(
                                 "preview-prompt",
                                 if self.prompt_preview.is_some() {
                                     "收起发送内容"
                                 } else {
                                     "查看发送内容"
                                 },
-                                self.prompt_preview.is_some(),
+                                false,
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_prompt_preview();
