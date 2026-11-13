@@ -17,6 +17,7 @@ TraceBit 按活动段记录前台应用、窗口标题、空闲/锁屏状态和�
 - 应用切换与定时心跳截图（截取前台窗口所在的显示器）；缩略图哈希、直方图和像素差异三级去重
 - 可选浏览网站记录：主动开启后，通过 Windows UI Automation 仅保存当前浏览器域名，并按网站把浏览器时间归入开发、文档、娱乐等类别
 - AI 效率建议：本地计算深度工作块、应用来回切换、通讯打断、会议碎片、高效时段被占用、连续未休息、反复出现的工作和近 7 天趋势等证据；AI 只负责找根因、排优先级、给出具体做法，每条建议都必须引用证据编号，无法核实的数字会被标出
+- 完整报告以独立 HTML 页面在浏览器中打开：指标卡、关键发现、建议卡片、明日实验，依据编号可点击跳转，支持深色模式和打印
 - 实验闭环：每份建议附带一个可量化的明日实验，下一份建议自动核对是否达成，并据此调整建议
 - 可选截图时段摘要：按整点对齐的时段选取快照，附带当时的前台应用，由上方配置的多模态模型总结，摘要会作为建议的依据
 - 可工具化操作推荐：本地规则根据真实切换和时长证据匹配开源项目、Skill、MCP，作为候选交给 AI 选用
@@ -31,7 +32,7 @@ TraceBit 按活动段记录前台应用、窗口标题、空闲/锁屏状态和�
 
 ### 已编译版本
 
-运行 `dist/TraceBit Setup 0.4.0.exe`。安装到 `%LOCALAPPDATA%\Programs\TraceBit`，不需要安装 Rust 或其他运行时。卸载程序不会主动删除 `%APPDATA%\TraceBit` 中的个人记录。
+运行 `dist/TraceBit Setup 0.4.1.exe`。安装到 `%LOCALAPPDATA%\Programs\TraceBit`，不需要安装 Rust 或其他运行时。卸载程序不会主动删除 `%APPDATA%\TraceBit` 中的个人记录。
 
 ### 从源码运行
 
@@ -63,7 +64,7 @@ scripts\dist.cmd
 脚本会执行 `cargo build --release` 并生成：
 
 ```text
-dist\TraceBit Setup 0.4.0.exe
+dist\TraceBit Setup 0.4.1.exe
 ```
 
 发布程序只有一个内嵌图标的 `tracebit.exe`，无 Electron 运行时和 PowerShell 脚本。
@@ -95,6 +96,7 @@ dist\TraceBit Setup 0.4.0.exe
 │   ├── days\YYYY-MM-DD.jsonl # 前台、空闲、锁屏、快照索引事件
 │   └── snapshots\YYYY-MM-DD\ # JPG 快照
 ├── reports\YYYY-MM-DD.json   # 已生成建议（含证据、实验和 token 用量）
+├── reports\YYYY-MM-DD.html   # 同一份建议的浏览器版报告
 └── intervals\
     ├── YYYY-MM-DD.jsonl      # 截图时段摘要
     ├── last_request.json     # 最近一次发给视觉模型的文本和截图列表
@@ -125,6 +127,7 @@ src/
   store.rs           # JSONL 日存储与时间线/活动段/应用/网站/分类统计
   insights.rs        # 本地指标和带编号的证据（深度工作、打断、碎片、趋势）
   analyzer.rs        # 建议生成：提示词、JSON 校验、实验闭环、Markdown 渲染
+  report_html.rs     # 建议的独立 HTML 报告
   llm.rs             # OpenAI 兼容调用：JSON 模式、重试、截断检测
   redact.rs          # 发送前脱敏与标题清理
   secret.rs          # DPAPI 密钥加密

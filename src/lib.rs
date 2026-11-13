@@ -9,6 +9,7 @@ pub mod platform;
 pub mod recommendations;
 pub mod recorder;
 pub mod redact;
+pub mod report_html;
 pub mod secret;
 pub mod settings;
 pub mod store;

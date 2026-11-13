@@ -1621,10 +1621,7 @@ impl TraceBitWindow {
             if !report.prompt_version.is_empty() {
                 meta = meta.child(report.prompt_version.clone());
             }
-            document = document.child(meta);
-            for (index, line) in report.markdown.lines().enumerate() {
-                document = document.child(render_markdown_line(index, line));
-            }
+            document = document.child(meta).child(self.render_report_summary(report, cx));
         } else {
             document = document.child(
                 div()
@@ -1635,6 +1632,110 @@ impl TraceBitWindow {
             );
         }
         page.child(document).child(self.render_report_history(cx))
+    }
+
+    /// Compact in-app summary; the full report opens as an HTML page.
+    fn render_report_summary(&self, report: &Report, cx: &mut Context<Self>) -> Div {
+        let open_button = button("open-report-html", "在浏览器中查看完整报告", true).on_click(
+            cx.listener(|this, _, _, cx| {
+                if let Some(report) = &this.report {
+                    match this.analyzer.write_html(report) {
+                        Ok(path) => {
+                            let _ = open::that(path);
+                        }
+                        Err(error) => {
+                            this.notice = Some((format!("无法打开报告：{error:#}"), false));
+                        }
+                    }
+                }
+                cx.notify();
+            }),
+        );
+        let Some(advice) = &report.advice else {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(SECONDARY))
+                        .child(report_excerpt(&report.markdown)),
+                )
+                .child(div().flex().child(open_button));
+        };
+        let mut summary = div().flex().flex_col().gap_4().child(
+            div()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(BRAND_PALE))
+                .text_size(px(17.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(advice.headline.trim().to_owned()),
+        );
+        if let Some(metrics) = &report.metrics {
+            summary = summary.child(
+                div()
+                    .flex()
+                    .py_3()
+                    .border_y_1()
+                    .border_color(rgb(DIVIDER))
+                    .child(metric("活跃", &format!("{:.0} 分钟", metrics.active_min), ""))
+                    .child(metric(
+                        "深度工作",
+                        &format!("{:.0} 分钟", metrics.deep_work_min),
+                        &format!("{:.0} 块", metrics.deep_blocks),
+                    ))
+                    .child(metric("每小时切换", &format!("{:.1} 次", metrics.switches_per_hour), ""))
+                    .child(metric("打开通讯", &format!("{:.0} 次", metrics.comm_checks), "")),
+            );
+        }
+        let mut list = div().flex().flex_col().gap_2().child(
+            div()
+                .text_xs()
+                .text_color(rgb(FAINT))
+                .child(format!("{} 条建议", advice.suggestions.len())),
+        );
+        for (index, suggestion) in advice.suggestions.iter().enumerate() {
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(22.))
+                            .rounded_full()
+                            .bg(rgb(if index == 0 { ACCENT } else { INK }))
+                            .text_color(rgb(0xffffff))
+                            .text_xs()
+                            .child(format!("{}", index + 1)),
+                    )
+                    .child(div().flex_1().text_sm().child(suggestion.title.trim().to_owned()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(FAINT))
+                            .child(format!(
+                                "{} · 投入{} · 把握{}",
+                                suggestion.kind, suggestion.effort, suggestion.confidence
+                            )),
+                    ),
+            );
+        }
+        summary = summary.child(list);
+        if let Some(experiment) = &advice.experiment {
+            summary = summary.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(SECONDARY))
+                    .child(format!("明日实验：{}", experiment.action.trim())),
+            );
+        }
+        summary.child(div().flex().child(open_button))
     }
 
     fn render_ai_setup(&mut self, cx: &mut Context<Self>) -> Div {
@@ -2361,72 +2462,6 @@ fn setting_row(name: &str, description: &str, control: impl IntoElement) -> Div 
         .gap_4()
         .child(setting_label(name, description))
         .child(div().w(px(360.)).child(control))
-}
-
-fn render_markdown_line(index: usize, line: &str) -> Stateful<Div> {
-    let trimmed = line.trim();
-    let (size, weight) = if trimmed.starts_with("# ") {
-        (24., FontWeight::BOLD)
-    } else if trimmed.starts_with("## ") {
-        (18., FontWeight::SEMIBOLD)
-    } else if trimmed.starts_with("### ") {
-        (14., FontWeight::SEMIBOLD)
-    } else {
-        (14., FontWeight::NORMAL)
-    };
-    let text = clean_inline(trimmed.trim_start_matches('#').trim_start());
-    let url = markdown_url(trimmed);
-    let mut element = div()
-        .id(SharedString::from(format!("report-line-{index}")))
-        .text_size(px(size))
-        .font_weight(weight)
-        .py_1();
-    if trimmed.starts_with('>') {
-        element = element
-            .p_3()
-            .rounded_md()
-            .bg(rgb(CANVAS))
-            .text_color(rgb(SECONDARY));
-    }
-    if let Some(url) = url {
-        element = element
-            .tab_index(0)
-            .cursor_pointer()
-            .focus(|style| style.bg(rgb(SUBTLE)))
-            .text_color(rgb(0x4277a8))
-            .on_click(move |_, _, _| {
-                let _ = open::that(&url);
-            });
-    }
-    element.child(if text.is_empty() {
-        " ".to_owned()
-    } else {
-        text
-    })
-}
-
-fn clean_inline(value: &str) -> String {
-    let mut output = value.replace("**", "").replace('`', "");
-    while let Some(start) = output.find('[') {
-        let Some(middle) = output[start..].find("](") else {
-            break;
-        };
-        let middle = start + middle;
-        let Some(end) = output[middle + 2..].find(')') else {
-            break;
-        };
-        let end = middle + 2 + end;
-        let name = output[start + 1..middle].to_owned();
-        let url = output[middle + 2..end].to_owned();
-        output.replace_range(start..=end, &format!("{name}（{url}）"));
-    }
-    output
-}
-
-fn markdown_url(value: &str) -> Option<String> {
-    let start = value.find("](https://")? + 2;
-    let end = value[start..].find(')')? + start;
-    Some(value[start..end].to_owned())
 }
 
 fn has_ai(settings: &SettingsData) -> bool {

@@ -584,6 +584,15 @@ impl Analyzer {
         Ok(self.reports_dir.join(format!("{date_key}.json")))
     }
 
+    /// Writes the report as a standalone HTML page next to its JSON and returns
+    /// the path. Rendered from the stored JSON, so older reports work too.
+    pub fn write_html(&self, report: &Report) -> Result<PathBuf> {
+        validate_date_key(&report.date_key)?;
+        let file = self.reports_dir.join(format!("{}.html", report.date_key));
+        fs::write(&file, crate::report_html::render(report))?;
+        Ok(file)
+    }
+
     pub fn get_report(&self, date_key: &str) -> Option<Report> {
         let file = self.report_file(date_key).ok()?;
         fs::read_to_string(file)
@@ -839,6 +848,7 @@ impl Analyzer {
             self.report_file(date_key)?,
             serde_json::to_vec_pretty(&report)?,
         )?;
+        let _ = self.write_html(&report);
         Ok(report)
     }
 
@@ -1015,6 +1025,10 @@ mod tests {
         assert_eq!(report.usage.prompt_tokens, 100);
         assert!(!report.input_hash.is_empty());
         assert!(analyzer.get_report(&date_key).is_some());
+        let html = fs::read_to_string(temp.path().join("reports").join(format!("{date_key}.html"))).unwrap();
+        assert!(html.contains("用 lazygit 集中处理提交"));
+        assert!(html.contains("明日实验"));
+        assert!(!html.contains("<script"));
     }
 
     #[test]
