@@ -3,6 +3,7 @@ use crate::{
     input::{self, TextInput},
     intervals::{IntervalAnalyzer, IntervalSummary, SentRequest},
     platform,
+    profile::DecisionKind,
     recorder::{Recorder, RecorderStatus},
     settings::{Settings, SettingsData},
     store::{DayStats, DayStore, DeriveOptions, hhmm, local_date_key, now_ms},
@@ -75,6 +76,7 @@ struct FormState {
     api_key: Entity<TextInput>,
     model: Entity<TextInput>,
     auto_time: Entity<TextInput>,
+    digest_time: Entity<TextInput>,
     screenshot_interval: Entity<TextInput>,
     search_key: Entity<TextInput>,
     heartbeat: Entity<TextInput>,
@@ -106,6 +108,7 @@ impl FormState {
             ),
             model: input(cx, settings.ai.model.clone(), "deepseek-chat", false),
             auto_time: input(cx, settings.ai.auto_report_time.clone(), "21:30", false),
+            digest_time: input(cx, settings.ai.daily_digest_time.clone(), "10:30", false),
             screenshot_interval: input(
                 cx,
                 (settings.ai.screenshot_analysis_interval_ms / 60_000).to_string(),
@@ -170,6 +173,14 @@ impl FormState {
                 "21:30".to_owned()
             }
         };
+        draft.ai.daily_digest_time = {
+            let value = value(&self.digest_time);
+            if value.len() == 5 && value.as_bytes().get(2) == Some(&b':') {
+                value
+            } else {
+                "10:30".to_owned()
+            }
+        };
         draft.ai.screenshot_analysis_interval_ms = value(&self.screenshot_interval)
             .parse::<u64>()
             .unwrap_or(30)
@@ -221,6 +232,8 @@ pub struct TraceBitWindow {
     day: DayStats,
     report: Option<Report>,
     report_list: Vec<ReportSummary>,
+    /// Tool decisions, mirrored from the profile so the buttons show state.
+    decisions: BTreeMap<String, bool>,
     interval_summaries: Vec<IntervalSummary>,
     interval_error: Option<String>,
     interval_request: Option<SentRequest>,
@@ -262,6 +275,16 @@ impl TraceBitWindow {
         let day = load_day(&store, &settings, &local_date_key(now_ms()));
         let report = analyzer.get_report(&local_date_key(now_ms()));
         let report_list = analyzer.list_reports();
+        let decisions = analyzer
+            .profile()
+            .decisions
+            .iter()
+            .filter_map(|decision| {
+                decision
+                    .kind
+                    .map(|kind| (decision.opportunity.clone(), kind == DecisionKind::Adopted))
+            })
+            .collect::<BTreeMap<_, _>>();
         let interval_summaries = interval_analyzer.list(&local_date_key(now_ms()));
         let interval_request = interval_analyzer.last_request();
         let status = recorder.status();
@@ -281,6 +304,7 @@ impl TraceBitWindow {
             day,
             report,
             report_list,
+            decisions,
             interval_summaries,
             interval_error: None,
             interval_request,
@@ -327,7 +351,7 @@ impl TraceBitWindow {
         self.poll_test_task();
         self.poll_tray(window, cx);
         while let Ok(date_key) = self.auto_rx.try_recv() {
-            self.notice = Some(("效率建议已自动生成".to_owned(), true));
+            self.notice = Some(("工具升级建议已自动生成".to_owned(), true));
             if self.date_key() == date_key {
                 self.report = self.analyzer.get_report(&date_key);
             }
@@ -393,7 +417,7 @@ impl TraceBitWindow {
             match result {
                 Ok(report) => {
                     self.report = Some(report);
-                    self.notice = Some(("效率建议已生成".to_owned(), true));
+                    self.notice = Some(("工具升级建议已生成".to_owned(), true));
                     self.report_list = self.analyzer.list_reports();
                 }
                 Err(error) => {
@@ -1265,7 +1289,7 @@ impl TraceBitWindow {
         section()
             .gap_3()
             .child(panel_head(
-                "AI 效率建议",
+                "AI 工具升级建议",
                 if self.report.is_some() {
                     "已生成"
                 } else {
@@ -1281,7 +1305,7 @@ impl TraceBitWindow {
                         .filter(|headline| !headline.is_empty())
                         .unwrap_or_else(|| report_excerpt(&report.markdown))
                 } else if configured {
-                    "找出今天最值得改变的行为，给出可执行的建议和明天的小实验。".to_owned()
+                    "根据你实际的工作方式，找能让现有动作更省力的工具、插件和开源替代。".to_owned()
                 } else {
                     "连接模型后即可生成建议；截图分析可在设置中单独开启。".to_owned()
                 },
@@ -1478,8 +1502,8 @@ impl TraceBitWindow {
             .min_w(px(0.))
             .gap_5()
             .child(self.render_page_head(
-                "AI 效率建议",
-                "从当天记录中找出最值得改变的行为，给出可执行的建议和可验证的小实验",
+                "AI 工具升级建议",
+                "学习你实际的工作方式，只推荐能让现有动作更省力的工具、配置和开源替代",
                 true,
                 cx,
             ));
@@ -1621,7 +1645,9 @@ impl TraceBitWindow {
             if !report.prompt_version.is_empty() {
                 meta = meta.child(report.prompt_version.clone());
             }
-            document = document.child(meta).child(self.render_report_summary(report, cx));
+            document = document
+                .child(meta)
+                .child(self.render_report_summary(report, cx));
         } else {
             document = document.child(
                 div()
@@ -1680,23 +1706,48 @@ impl TraceBitWindow {
                     .py_3()
                     .border_y_1()
                     .border_color(rgb(DIVIDER))
-                    .child(metric("活跃", &format!("{:.0} 分钟", metrics.active_min), ""))
+                    .child(metric(
+                        "活跃",
+                        &format!("{:.0} 分钟", metrics.active_min),
+                        "",
+                    ))
                     .child(metric(
                         "深度工作",
                         &format!("{:.0} 分钟", metrics.deep_work_min),
                         &format!("{:.0} 块", metrics.deep_blocks),
                     ))
-                    .child(metric("每小时切换", &format!("{:.1} 次", metrics.switches_per_hour), ""))
-                    .child(metric("打开通讯", &format!("{:.0} 次", metrics.comm_checks), "")),
+                    .child(metric(
+                        "每小时切换",
+                        &format!("{:.1} 次", metrics.switches_per_hour),
+                        "",
+                    ))
+                    .child(metric(
+                        "打开通讯",
+                        &format!("{:.0} 次", metrics.comm_checks),
+                        "",
+                    )),
             );
         }
         let mut list = div().flex().flex_col().gap_2().child(
             div()
                 .text_xs()
                 .text_color(rgb(FAINT))
-                .child(format!("{} 条建议", advice.suggestions.len())),
+                .child(format!("{} 个工具升级机会", advice.upgrades.len())),
         );
-        for (index, suggestion) in advice.suggestions.iter().enumerate() {
+        for (index, upgrade) in advice.upgrades.iter().enumerate() {
+            let mut title = div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(div().text_sm().child(upgrade.title.trim().to_owned()));
+            if !upgrade.habit.trim().is_empty() {
+                title = title.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(FAINT))
+                        .child(format!("接上你现在：{}", upgrade.habit.trim())),
+                );
+            }
             list = list.child(
                 div()
                     .flex()
@@ -1714,26 +1765,101 @@ impl TraceBitWindow {
                             .text_xs()
                             .child(format!("{}", index + 1)),
                     )
-                    .child(div().flex_1().text_sm().child(suggestion.title.trim().to_owned()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(FAINT))
-                            .child(format!(
-                                "{} · 投入{} · 把握{}",
-                                suggestion.kind, suggestion.effort, suggestion.confidence
-                            )),
-                    ),
+                    .child(title)
+                    .child(div().text_xs().text_color(rgb(FAINT)).child(format!(
+                        "{} · 投入{} · 把握{}",
+                        upgrade.kind, upgrade.effort, upgrade.confidence
+                    ))),
             );
         }
         summary = summary.child(list);
-        if let Some(experiment) = &advice.experiment {
-            summary = summary.child(
+
+        if let Some(profile) = &report.profile {
+            let top = profile
+                .tools
+                .iter()
+                .take(2)
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            summary = summary.child(div().text_sm().text_color(rgb(SECONDARY)).child(
+                if top.is_empty() {
+                    format!("已学习 {} 天的工作方式", profile.days)
+                } else {
+                    format!("已学习 {} 天的工作方式：{}", profile.days, top)
+                },
+            ));
+        }
+
+        if !report.recommendations.is_empty() {
+            let mut candidates = div().flex().flex_col().gap_2().child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(SECONDARY))
-                    .child(format!("明日实验：{}", experiment.action.trim())),
+                    .text_xs()
+                    .text_color(rgb(FAINT))
+                    .child("工具候选 · 记录你的选择，下次报告会对比同类来回"),
             );
+            for item in &report.recommendations {
+                let date = report.date_key.clone();
+                let opportunity = item.id.clone();
+                let resource = item
+                    .resources
+                    .first()
+                    .map(|resource| resource.name.clone())
+                    .unwrap_or_else(|| item.title.clone());
+                let url = item
+                    .resources
+                    .first()
+                    .map(|resource| resource.url.clone())
+                    .unwrap_or_default();
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().text_sm().child(resource.clone()));
+                for adopted in [true, false] {
+                    let selected = self
+                        .decisions
+                        .get(&item.id)
+                        .is_some_and(|value| *value == adopted);
+                    let date = date.clone();
+                    let opportunity = opportunity.clone();
+                    let resource = resource.clone();
+                    let url = url.clone();
+                    row = row.child(
+                        small_button(
+                            SharedString::from(format!("decide-{}-{adopted}", opportunity)),
+                            if adopted { "已用上" } else { "不需要" },
+                            selected,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            match this.analyzer.decide(
+                                &date,
+                                &opportunity,
+                                &resource,
+                                &url,
+                                adopted,
+                            ) {
+                                Ok(_) => {
+                                    this.decisions.insert(opportunity.clone(), adopted);
+                                    this.notice = Some((
+                                        format!(
+                                            "已记录：{}。下次生成会自动对比同类来回。",
+                                            if adopted { "已用上" } else { "不需要" }
+                                        ),
+                                        true,
+                                    ))
+                                }
+                                Err(error) => {
+                                    this.notice = Some((format!("记录失败：{error:#}"), false))
+                                }
+                            }
+                            cx.notify();
+                        })),
+                    );
+                }
+                candidates = candidates.child(row);
+            }
+            summary = summary.child(candidates);
         }
         summary.child(div().flex().child(open_button))
     }
@@ -1888,8 +2014,22 @@ impl TraceBitWindow {
                 self.form.auto_time.clone(),
             ))
             .child(self.toggle_row(
-                "联网搜索效率资源",
-                "仅发送抽象工具关键词，不发送行为记录",
+                "每日推送昨日建议",
+                "到点发送系统通知：昨日结论和一句问候；昨天没有记录时不打扰",
+                self.draft.ai.daily_digest,
+                cx.listener(|this, _, _, cx| {
+                    this.draft.ai.daily_digest = !this.draft.ai.daily_digest;
+                    cx.notify();
+                }),
+            ))
+            .child(setting_row(
+                "推送时间",
+                "24 小时制，默认 10:30",
+                self.form.digest_time.clone(),
+            ))
+            .child(self.toggle_row(
+                "联网检索开源替代",
+                "按抽象工具关键词补充候选，不发送行为记录",
                 self.draft.ai.web_search,
                 cx.listener(|this, _, _, cx| {
                     this.draft.ai.web_search = !this.draft.ai.web_search;
@@ -2289,7 +2429,7 @@ fn create_tray(active: bool) -> Option<TrayState> {
         None,
     );
     let show = MenuItem::with_id("show", "显示主窗口", true, None);
-    let report = MenuItem::with_id("report", "查看效率建议", true, None);
+    let report = MenuItem::with_id("report", "查看工具升级建议", true, None);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let menu = Menu::new();
     menu.append_items(&[&status, &toggle, &show, &report, &quit])
@@ -2646,17 +2786,80 @@ fn spawn_auto_report(
     thread::spawn(move || {
         let mut retry_after: BTreeMap<String, std::time::Instant> = BTreeMap::new();
         let mut first = true;
+        // Learn recent days once, independent of whether AI is configured.
+        let _ = analyzer.backfill_profile(30);
+        let mut last_observed: Option<std::time::Instant> = None;
         loop {
             if !first {
                 thread::sleep(Duration::from_secs(60));
             }
             first = false;
+            let now = Local::now();
+            let today = now.format("%Y-%m-%d").to_string();
+            // Keep today's profile entry fresh without recomputing every minute.
+            if last_observed.is_none_or(|at| at.elapsed() >= Duration::from_secs(600)) {
+                last_observed = Some(std::time::Instant::now());
+                let _ = analyzer.observe_profile(&today);
+            }
             let ai = settings.get().ai;
+            // Daily digest: yesterday's advice plus a greeting, once a day. It
+            // runs whether or not automatic generation is enabled.
+            if ai.daily_digest {
+                let today_key = today.clone();
+                if let Some(scheduled) =
+                    crate::analyzer::scheduled_ts(&today_key, &ai.daily_digest_time)
+                    && crate::digest::is_due(
+                        now.timestamp_millis(),
+                        scheduled,
+                        analyzer.last_digest().as_deref(),
+                        &today_key,
+                    )
+                {
+                    let yesterday = (now - ChronoDuration::days(1))
+                        .format("%Y-%m-%d")
+                        .to_string();
+                    let mut report = analyzer.get_report(&yesterday);
+                    if report.is_none()
+                        && ai.auto_report
+                        && ai.text_endpoint().configured()
+                        && analyzer.needs_auto_report(&yesterday, scheduled)
+                    {
+                        report = analyzer.generate_report_as(&yesterday, "auto").ok();
+                    }
+                    let has_activity = analyzer.has_activity(&yesterday);
+                    let digest = match &report {
+                        Some(report) => {
+                            let advice = report.advice.as_ref();
+                            crate::digest::Digest {
+                                headline: advice
+                                    .map(|advice| advice.headline.as_str())
+                                    .unwrap_or(""),
+                                top_upgrade: advice
+                                    .and_then(|advice| advice.upgrades.first())
+                                    .map(|upgrade| upgrade.title.as_str())
+                                    .unwrap_or(""),
+                                upgrades: advice.map(|advice| advice.upgrades.len()).unwrap_or(0),
+                                has_report: true,
+                                has_activity,
+                            }
+                        }
+                        None => crate::digest::Digest {
+                            headline: "",
+                            top_upgrade: "",
+                            upgrades: 0,
+                            has_report: false,
+                            has_activity,
+                        },
+                    };
+                    if let Some((title, body)) = crate::digest::compose(now, Some(digest)) {
+                        platform::show_notification(&title, &body);
+                    }
+                    let _ = analyzer.mark_digest_sent(&today_key);
+                }
+            }
             if !ai.auto_report || !ai.text_endpoint().configured() {
                 continue;
             }
-            let now = Local::now();
-            let today = now.format("%Y-%m-%d").to_string();
             let yesterday = (now - ChronoDuration::days(1))
                 .format("%Y-%m-%d")
                 .to_string();
@@ -2686,8 +2889,8 @@ fn spawn_auto_report(
                     Ok(_) => {
                         retry_after.remove(&date_key);
                         platform::show_notification(
-                            "TraceBit 效率建议已生成",
-                            &format!("{date_key} 的效率建议已就绪"),
+                            "TraceBit 工具升级建议已生成",
+                            &format!("{date_key} 的工具升级建议已就绪"),
                         );
                         let _ = sender.send(date_key);
                     }

@@ -39,7 +39,7 @@ pub struct MetricDef {
     pub better: Better,
 }
 
-/// Metrics an experiment can target. Keys are part of the AI output contract.
+/// Metrics a report can watch. Keys are part of the AI output contract.
 pub const METRICS: [MetricDef; 10] = [
     MetricDef {
         key: "active_min",
@@ -349,7 +349,7 @@ pub fn day_metrics(stats: &DayStats) -> DayMetrics {
 
 /// Title key that groups "a.rs - Project - VS Code" and "b.rs - Project - VS Code"
 /// differently but survives unread-count prefixes like "(3) Inbox".
-fn title_key(title: &str) -> String {
+pub(crate) fn title_key(title: &str) -> String {
     let title = title.trim();
     let title = title
         .strip_prefix('(')

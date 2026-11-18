@@ -1,10 +1,12 @@
-//! The advisor: local evidence + AI reasoning -> prioritized, verifiable advice.
+//! The advisor: learned work profile + local evidence + AI reasoning -> tool upgrades.
 //!
-//! Pipeline: day stats (+7 days of history) -> deterministic metrics and numbered
-//! evidence (`insights`) -> screenshot interval summaries -> rule-based tool
-//! candidates -> one JSON-mode model call -> validation against the evidence ->
-//! locally rendered Markdown. Each report stores a measurable experiment that the
-//! next report scores automatically, closing the loop.
+//! Pipeline: persistent work profile -> day stats (+7 days of history) ->
+//! deterministic metrics and numbered evidence (`insights`) -> screenshot
+//! interval summaries -> rule-based tool candidates (including open-source
+//! alternatives) -> one JSON-mode model call -> validation against the evidence
+//! and the "no behavior change" guard -> locally rendered Markdown. Each report
+//! also records metrics worth watching next time; the next report compares them
+//! on its own, and tools the person marked as adopted are re-measured.
 
 use crate::{
     insights::{
@@ -13,6 +15,7 @@ use crate::{
     },
     intervals::read_summaries,
     llm::{self, ChatOptions, Usage},
+    profile::{Decision, DecisionKind, Profile, Snapshot as ProfileSnapshot},
     recommendations::{Recommendation, SearchSummary, build_recommendations},
     redact::redact_with_limit,
     settings::Settings,
@@ -21,6 +24,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use chrono::{Duration as ChronoDuration, NaiveDate};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
@@ -28,35 +32,45 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 pub use crate::redact::redact_text;
 
-pub const PROMPT_VERSION: &str = "advice-v2";
+pub const PROMPT_VERSION: &str = "advice-v3";
 const HISTORY_DAYS: i64 = 7;
-const SUGGESTION_TYPES: [&str; 5] = ["习惯", "日程", "环境", "工具", "自动化"];
+/// How many tool opportunities a report keeps.
+const MAX_OPPORTUNITIES: usize = 4;
+const UPGRADE_TYPES: [&str; 5] = ["工具", "替代", "自动化", "配置", "集成"];
 const LEVELS: [&str; 3] = ["低", "中", "高"];
 
+/// A statement about how this person works, taken from the evidence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
-pub struct Finding {
-    #[serde(alias = "text")]
-    pub finding: String,
+pub struct Observation {
+    #[serde(alias = "finding")]
+    pub observation: String,
     pub evidence: Vec<String>,
+    pub confidence: String,
 }
 
+/// A concrete tool or configuration change that makes an existing action cheaper.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
-pub struct Suggestion {
+pub struct Upgrade {
     pub title: String,
     #[serde(rename = "type")]
     pub kind: String,
     pub evidence: Vec<String>,
-    pub why: String,
+    /// The existing habit or action this attaches to.
+    pub habit: String,
+    /// What that action costs today, according to the evidence.
+    pub problem: String,
     pub actions: Vec<String>,
-    pub when: String,
-    pub expected: String,
+    pub payoff: String,
+    pub risk: String,
+    /// The tool this one replaces, if any.
+    pub alternative: String,
     pub effort: String,
     pub confidence: String,
     pub tools: Vec<String>,
@@ -64,41 +78,55 @@ pub struct Suggestion {
     pub unverified_numbers: Vec<String>,
 }
 
+/// A metric worth watching next time. Purely observational: no action needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
-pub struct Experiment {
-    pub hypothesis: String,
-    pub action: String,
+pub struct Watch {
     pub metric: String,
-    pub target: f64,
-    /// Metric value on the day the experiment was proposed.
+    pub reason: String,
     pub baseline: Option<f64>,
-    pub date_key: String,
 }
 
-impl Experiment {
-    fn wants_increase(&self) -> bool {
-        self.baseline.is_none_or(|baseline| self.target >= baseline)
+/// Before/after for a tool the person marked as adopted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AdoptionReview {
+    pub title: String,
+    pub resource: String,
+    pub date_key: String,
+    pub before: String,
+    pub after: Option<String>,
+}
+
+impl AdoptionReview {
+    pub fn text(&self) -> String {
+        match &self.after {
+            Some(after) => format!(
+                "你在 {} 记录了「{}」。当时：{} 现在：{}",
+                self.date_key, self.resource, self.before, after
+            ),
+            None => format!(
+                "你在 {} 记录了「{}」。当时：{} 今天这类来回已经不再是候选，说明它要么已经解决，要么当天没有发生。",
+                self.date_key, self.resource, self.before
+            ),
+        }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
-pub struct ExperimentReview {
-    pub experiment: Experiment,
-    pub actual: Option<f64>,
-    pub achieved: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase", default)]
 pub struct Advice {
+    /// One sentence describing how this person works, not a request.
     pub headline: String,
-    pub diagnosis: Vec<Finding>,
-    pub suggestions: Vec<Suggestion>,
-    pub experiment: Option<Experiment>,
+    #[serde(alias = "diagnosis")]
+    pub reading: Vec<Observation>,
+    #[serde(alias = "suggestions")]
+    pub upgrades: Vec<Upgrade>,
+    pub watch: Vec<Watch>,
     pub followup: String,
     pub unverified_numbers: Vec<String>,
+    /// Upgrades dropped by the local "no behavior pressure" guard.
+    pub filtered: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,8 +151,12 @@ pub struct Report {
     pub evidence: Vec<Evidence>,
     #[serde(default)]
     pub metrics: Option<DayMetrics>,
+    /// The accumulated picture of how this person works.
     #[serde(default)]
-    pub review: Option<ExperimentReview>,
+    pub profile: Option<ProfileSnapshot>,
+    /// Before/after for tools the person marked as adopted.
+    #[serde(default)]
+    pub adoptions: Vec<AdoptionReview>,
     /// "manual" or "auto"; automatic runs never overwrite a manual report.
     #[serde(default)]
     pub source: String,
@@ -152,28 +184,29 @@ pub struct AdviceContext {
     pub metrics: DayMetrics,
     pub evidence: Vec<Evidence>,
     pub recommendations: Vec<Recommendation>,
-    pub review: Option<ExperimentReview>,
+    pub profile: ProfileSnapshot,
+    pub adoptions: Vec<AdoptionReview>,
     pub system_prompt: String,
     pub user_prompt: String,
 }
 
-pub const SYSTEM_PROMPT: &str = r#"你是一位严谨、务实的个人效率顾问。你会拿到某人一天的电脑使用证据（由本地软件计算并脱敏）、近期趋势、截图时段摘要、上一次实验的结果和可用工具候选。
+pub const SYSTEM_PROMPT: &str = r#"你是一位工具升级顾问。你会拿到某人真实工作方式的长期画像、今天的电脑使用证据（由本地软件计算并脱敏）、截图时段摘要、可用工具候选，以及他之前对工具的决定。
 
-你的唯一目标：找出最值得改变的 1–3 个行为模式，给出明天就能执行、能明显省时间或精力的具体建议。不要写流水账式日报，不要复述数据。
+你的任务不是纠正他的习惯，而是让他已经在做的事更省力。
 
 思考方法：
-1. 找根因，不停在现象。组合多条证据推断原因：同一对应用高频来回且停留很短，通常是在查找或搬运信息；产出段中途频繁打开通讯，通常是消息通知在驱动注意力；会议之间留下 10–40 分钟碎片，通常是日程排布问题。
-2. 排序依据 = 预期收益 × 把握 ÷ 执行成本。
-3. 建议要具体到“什么时机、做什么动作、改什么设置或用什么工具”。例如“把微信设为免打扰，每天 11:30 和 17:00 集中回复”，而不是“减少分心”。
-4. 改环境比靠意志力有效：至少一条建议属于 环境、工具 或 自动化 类型。
-5. 如果给出了上一次实验的结果：达成就建议固化并提高一点要求；未达成就分析可能原因并调整做法，不要原样重复。
-6. 证据不足以支撑的推断，confidence 设为“低”，并在 why 里说明需要验证什么。
+1. 先读懂这个人怎么工作：他用什么工具、在哪些工具之间来回、在什么时段产出、反复处理哪些项目。写进 reading，用陈述句描述事实，不评价。
+2. 再针对具体动作找升级：这个动作今天花了他多少时间和步骤？有没有同类工具、插件、快捷键、命令、配置或自动化，能让同一个动作少几步、少几次跳转、少几次手工搬运？
+3. 排序依据 = 每天发生的次数 × 每次浪费的步骤 × 上手成本。
 
-硬性规则：
-- 每条发现和建议都必须引用给出的证据编号（如 E1、S2），不得引用不存在的编号。
-- 不得编造证据中没有的数字、应用或时间。估算收益时写明依据了哪个证据中的数字。
-- tools 只能填写工具候选的编号；没有合适的就填空数组。不要自己写工具名或链接。
-- 不评价人格，不说教，不写“多休息”“做好时间管理”这类空话。
+硬性规则（违反即作废）：
+- 不得要求他改变习惯。禁止出现这类建议：减少/戒掉/少用/限制使用、定时集中回复、关闭通知、早睡、多休息、保持专注、自律、番茄钟、时间管理。不要评价他的作息、注意力或意志力。
+- 每条 upgrade 必须落到可安装、可配置或可执行的东西上：具体工具、插件、快捷键、命令、模板、脚本或设置项。只讲道理而不给出具体东西的，不要写。
+- habit 必须写清楚它接上他现在哪个动作（例如“你每天已经在终端里跑 git 命令”），不要假设他会形成新流程。
+- 优先开源、可本地运行、无账号锁定的选择；能替代他现在用的付费或受限工具时，在 alternative 写明替代对象。
+- 必须引用证据编号（E 开头是今天，P 开头是长期画像，S 开头是截图摘要）。不得编造证据里没有的数字、应用或时间；payoff 里出现的数字必须来自证据。
+- tools 只能填工具候选的编号；候选里没有合适的就填空数组，不要自己写工具名或链接。
+- 已采纳的工具不要当作新发现重复推荐；已标记不需要的工具不要再次推荐。
 - 简体中文。只输出一个 JSON 对象，不要 Markdown，不要代码块。"#;
 
 fn output_contract(metrics: &DayMetrics) -> String {
@@ -193,25 +226,26 @@ fn output_contract(metrics: &DayMetrics) -> String {
     format!(
         r#"输出 JSON 结构（字段名必须一致）：
 {{
-  "headline": "一句话指出最值得改变的一件事，不超过 40 字",
-  "diagnosis": [{{"finding": "根因层面的发现", "evidence": ["E1"]}}],
-  "suggestions": [{{
-    "title": "动词开头，不超过 20 字",
-    "type": "习惯|日程|环境|工具|自动化",
-    "evidence": ["E2", "S1"],
-    "why": "为什么能解决根因",
+  "headline": "一句话描述他实际怎么工作（陈述句，不是要求），不超过 40 字",
+  "reading": [{{"observation": "关于他工作方式的观察", "evidence": ["P1", "E2"], "confidence": "高|中|低"}}],
+  "upgrades": [{{
+    "title": "具体工具或做法，动词开头，不超过 20 字",
+    "type": "工具|替代|自动化|配置|集成",
+    "evidence": ["E1"],
+    "habit": "它接上你现在做的哪件事",
+    "problem": "这件事现在的时间和步骤成本（引用证据里的数字）",
     "actions": ["第一步具体动作", "第二步"],
-    "when": "何时开始，或在什么触发条件下执行",
-    "expected": "预期收益和推算依据",
+    "payoff": "省下的时间或步骤，及依据",
+    "risk": "风险与注意",
+    "alternative": "它替代的现有工具名；没有就空字符串",
     "effort": "低|中|高",
     "confidence": "高|中|低",
     "tools": ["工具候选编号"]
   }}],
-  "experiment": {{"hypothesis": "要验证的假设", "action": "明天具体做什么", "metric": "指标键名", "target": 0}},
-  "followup": "对上一次实验结果的解读和调整；没有上次实验则为空字符串"
+  "watch": [{{"metric": "指标键名", "reason": "为什么值得下次观察"}}],
+  "followup": "对上次采纳情况的说明；没有则空字符串"
 }}
-diagnosis 2–4 条；suggestions 3–5 条，按优先级排序；actions 1–4 步。
-experiment 必须对应排名第一或第二的建议，metric 只能取以下键之一，target 是明天要达到的数值：{keys}"#
+reading 2–4 条；upgrades 2–4 条，按优先级排序；actions 1–4 步；watch 1–2 条，metric 只能取以下键之一：{keys}"#
     )
 }
 
@@ -234,50 +268,30 @@ fn fmt_number(value: f64) -> String {
     }
 }
 
-fn review_text(review: &ExperimentReview) -> String {
-    let experiment = &review.experiment;
-    let def = metric_def(&experiment.metric);
-    let (label, unit) = def.map(|def| (def.label, def.unit)).unwrap_or(("指标", ""));
-    let comparator = if experiment.wants_increase() {
-        "≥"
-    } else {
-        "≤"
-    };
-    format!(
-        "上次实验（{} 提出）：{}。目标 {label} {comparator} {}{unit}（当时 {}{unit}），今天实际 {}{unit}，{}。",
-        experiment.date_key,
-        experiment.action,
-        fmt_number(experiment.target),
-        experiment
-            .baseline
-            .map(fmt_number)
-            .unwrap_or_else(|| "未知".to_owned()),
-        review
-            .actual
-            .map(fmt_number)
-            .unwrap_or_else(|| "无数据".to_owned()),
-        match review.achieved {
-            Some(true) => "已达成",
-            Some(false) => "未达成",
-            None => "无法判断",
-        }
-    )
-}
-
+#[allow(clippy::too_many_arguments)]
 fn build_user_prompt(
     date_key: &str,
     metrics: &DayMetrics,
     evidence: &[Evidence],
     summaries: &[Evidence],
+    profile: &[Evidence],
     recommendations: &[Recommendation],
-    review: Option<&ExperimentReview>,
+    decisions: &str,
+    adoptions: &[AdoptionReview],
 ) -> String {
     let mut lines = vec![format!(
-        "日期：{date_key}（{}）。以下数据由本地软件记录并计算，窗口标题已脱敏，聊天窗口只保留应用名。",
+        "日期：{date_key}（{}）。以下内容由本地软件记录、计算并脱敏，聊天窗口只保留应用名。",
         week_label(date_key)
     )];
+    if !profile.is_empty() {
+        lines.push(String::new());
+        lines.push("【长期工作画像】（P 开头，本机累计记录）".to_owned());
+        for item in profile {
+            lines.push(format!("{}：{}", item.id, item.text));
+        }
+    }
     lines.push(String::new());
-    lines.push("【证据】".to_owned());
+    lines.push("【今天的证据】（E 开头）".to_owned());
     for item in evidence {
         lines.push(format!("{}：{}", item.id, item.text));
     }
@@ -288,16 +302,25 @@ fn build_user_prompt(
             lines.push(format!("{}：{}", item.id, item.text));
         }
     }
+    if !decisions.trim().is_empty() {
+        lines.push(String::new());
+        lines.push("【他之前对工具的决定】".to_owned());
+        lines.push(decisions.trim().to_owned());
+    }
+    if !adoptions.is_empty() {
+        lines.push(String::new());
+        lines.push("【采纳回看】".to_owned());
+        for item in adoptions {
+            lines.push(format!("- {}", item.text()));
+        }
+    }
     lines.push(String::new());
-    lines.push("【上一次实验】".to_owned());
-    lines.push(review.map(review_text).unwrap_or_else(|| "无。".to_owned()));
-    lines.push(String::new());
-    lines.push("【工具候选】（本地规则根据证据匹配，只能按编号引用）".to_owned());
+    lines.push("【工具候选】（本地规则按今天的真实动作匹配，只能按编号引用）".to_owned());
     if recommendations.is_empty() {
         lines.push("无。".to_owned());
     }
     for item in recommendations {
-        lines.push(format!(
+        let mut line = format!(
             "{}：{}。触发依据：{} 可选工具：{}。",
             item.id,
             item.title,
@@ -307,7 +330,11 @@ fn build_user_prompt(
                 .map(|resource| format!("{}（{}）", resource.name, resource.kind))
                 .collect::<Vec<_>>()
                 .join("、")
-        ));
+        );
+        if !item.replaces.is_empty() {
+            line.push_str(&format!(" 可替代：{}。", item.replaces.join("、")));
+        }
+        lines.push(line);
     }
     lines.push(String::new());
     lines.push(output_contract(metrics));
@@ -332,6 +359,20 @@ fn unverified(text: &str, known: &BTreeSet<String>) -> Vec<String> {
         .collect()
 }
 
+/// Wording that tells the person to change behavior instead of changing tools.
+/// Upgrades matching it are dropped and reported, so the promise is enforced
+/// locally rather than only in the prompt.
+static BEHAVIOR_PRESSURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"戒掉|戒除|减少(?:使用|打开|查看|刷|玩)|少用|少看|不要(?:再)?(?:看|刷|玩)|定时(?:集中)?(?:回复|查看|处理)|关闭(?:消息)?通知|免打扰|早睡|多休息|番茄钟|自律|时间管理|提高专注|管理注意力",
+    )
+    .unwrap()
+});
+
+fn pushes_behavior(text: &str) -> bool {
+    BEHAVIOR_PRESSURE.is_match(text)
+}
+
 /// Drops everything that is not backed by the evidence and normalizes enums.
 pub fn validate_advice(
     mut advice: Advice,
@@ -339,7 +380,6 @@ pub fn validate_advice(
     tool_ids: &BTreeSet<String>,
     known: &BTreeSet<String>,
     metrics: &DayMetrics,
-    date_key: &str,
 ) -> Result<Advice> {
     let keep_ids = |ids: &mut Vec<String>| {
         let mut seen = BTreeSet::new();
@@ -349,47 +389,67 @@ pub fn validate_advice(
         }
     };
     let mut flagged = Vec::new();
-    advice.diagnosis.retain_mut(|finding| {
-        keep_ids(&mut finding.evidence);
-        flagged.extend(unverified(&finding.finding, known));
-        !finding.evidence.is_empty() && !finding.finding.trim().is_empty()
+    advice.reading.retain_mut(|item| {
+        keep_ids(&mut item.evidence);
+        flagged.extend(unverified(&item.observation, known));
+        item.observation = item.observation.trim().to_owned();
+        item.confidence = normalize_choice(&item.confidence, &LEVELS, "中");
+        !item.evidence.is_empty() && !item.observation.is_empty()
     });
-    advice.diagnosis.truncate(4);
-    advice.suggestions.retain_mut(|suggestion| {
-        keep_ids(&mut suggestion.evidence);
-        suggestion
-            .tools
-            .retain(|tool| tool_ids.contains(tool.trim()));
-        suggestion.kind = normalize_choice(&suggestion.kind, &SUGGESTION_TYPES, "习惯");
-        suggestion.effort = normalize_choice(&suggestion.effort, &LEVELS, "中");
-        suggestion.confidence = normalize_choice(&suggestion.confidence, &LEVELS, "中");
-        suggestion.actions = suggestion
+    advice.reading.truncate(4);
+
+    let mut filtered = Vec::new();
+    advice.upgrades.retain_mut(|upgrade| {
+        keep_ids(&mut upgrade.evidence);
+        upgrade.tools.retain(|tool| tool_ids.contains(tool.trim()));
+        upgrade.title = upgrade.title.trim().to_owned();
+        upgrade.kind = normalize_choice(&upgrade.kind, &UPGRADE_TYPES, "工具");
+        upgrade.effort = normalize_choice(&upgrade.effort, &LEVELS, "中");
+        upgrade.confidence = normalize_choice(&upgrade.confidence, &LEVELS, "中");
+        upgrade.actions = upgrade
             .actions
             .iter()
             .map(|action| action.trim().to_owned())
             .filter(|action| !action.is_empty())
             .take(4)
             .collect();
-        suggestion.unverified_numbers = unverified(&suggestion.why, known);
-        !suggestion.evidence.is_empty()
-            && !suggestion.title.trim().is_empty()
-            && !suggestion.actions.is_empty()
+        // Titles and imperative steps are where a behavior demand would show
+        // up; problem/payoff legitimately describe the current cost.
+        if pushes_behavior(&format!("{} {}", upgrade.title, upgrade.actions.join(" "))) {
+            filtered.push(upgrade.title.clone());
+            return false;
+        }
+        upgrade.unverified_numbers =
+            unverified(&format!("{} {}", upgrade.problem, upgrade.payoff), known);
+        !upgrade.evidence.is_empty() && !upgrade.title.is_empty() && !upgrade.actions.is_empty()
     });
-    advice.suggestions.truncate(5);
-    if advice.suggestions.is_empty() {
-        bail!("AI 输出中没有引用有效证据的建议，请重试或换用更强的模型");
+    advice.upgrades.truncate(4);
+    if advice.upgrades.is_empty() {
+        if !filtered.is_empty() {
+            bail!(
+                "AI 只给出了要求改变习惯的建议（已过滤 {} 条），请重试或换用更强的模型",
+                filtered.len()
+            );
+        }
+        bail!("AI 输出中没有引用有效证据的工具升级，请重试或换用更强的模型");
     }
+    advice.filtered = filtered;
+
+    advice.watch.retain_mut(|watch| {
+        let key = watch.metric.trim().to_owned();
+        let Some(baseline) = metrics.get(&key) else {
+            return false;
+        };
+        watch.metric = key;
+        watch.reason = watch.reason.trim().to_owned();
+        watch.baseline = Some(baseline);
+        !watch.reason.is_empty()
+    });
+    advice.watch.truncate(2);
+
     flagged.sort();
     flagged.dedup();
     advice.unverified_numbers = flagged;
-    advice.experiment = advice.experiment.take().and_then(|mut experiment| {
-        let baseline = metrics.get(experiment.metric.trim())?;
-        experiment.metric = experiment.metric.trim().to_owned();
-        experiment.baseline = Some(baseline);
-        experiment.date_key = date_key.to_owned();
-        (!experiment.action.trim().is_empty() && experiment.target.is_finite())
-            .then_some(experiment)
-    });
     Ok(advice)
 }
 
@@ -400,10 +460,10 @@ pub fn render_markdown(
     evidence: &[Evidence],
     recommendations: &[Recommendation],
     search: &SearchSummary,
-    review: Option<&ExperimentReview>,
+    adoptions: &[AdoptionReview],
 ) -> String {
     let mut lines = vec![
-        format!("# {date_key} 效率建议"),
+        format!("# {date_key} 工具升级建议"),
         String::new(),
         format!("> {}", advice.headline.trim()),
         String::new(),
@@ -417,56 +477,64 @@ pub fn render_markdown(
         ),
     ];
 
-    if let Some(review) = review {
-        lines.extend([String::new(), "## 上次实验回顾".to_owned()]);
-        lines.push(format!("- {}", review_text(review)));
+    if !adoptions.is_empty() {
+        lines.extend([String::new(), "## 采纳回看".to_owned()]);
+        for item in adoptions {
+            lines.push(format!("- {}", item.text()));
+        }
         if !advice.followup.trim().is_empty() {
-            lines.push(format!("- 解读：{}", advice.followup.trim()));
+            lines.push(format!("- 说明：{}", advice.followup.trim()));
         }
     }
 
-    if !advice.diagnosis.is_empty() {
-        lines.extend([String::new(), "## 关键发现".to_owned()]);
-        for finding in &advice.diagnosis {
+    if !advice.reading.is_empty() {
+        lines.extend([String::new(), "## 你的工作方式".to_owned()]);
+        for item in &advice.reading {
             lines.push(format!(
                 "- {}（依据 {}）",
-                finding.finding.trim(),
-                finding.evidence.join("、")
+                item.observation.trim(),
+                item.evidence.join("、")
             ));
         }
         if !advice.unverified_numbers.is_empty() {
             lines.push(format!(
-                "> 注意：以上发现中的数字 {} 无法在记录中核实，请谨慎参考。",
+                "> 注意：以上描述中的数字 {} 无法在记录中核实，请谨慎参考。",
                 advice.unverified_numbers.join("、")
             ));
         }
     }
 
-    lines.extend([String::new(), "## 建议".to_owned()]);
-    for (index, suggestion) in advice.suggestions.iter().enumerate() {
+    lines.extend([String::new(), "## 工具升级机会".to_owned()]);
+    for (index, upgrade) in advice.upgrades.iter().enumerate() {
         lines.push(String::new());
-        lines.push(format!("### {}. {}", index + 1, suggestion.title.trim()));
+        lines.push(format!("### {}. {}", index + 1, upgrade.title.trim()));
         lines.push(format!(
             "{} · 投入{} · 把握{} · 依据 {}",
-            suggestion.kind,
-            suggestion.effort,
-            suggestion.confidence,
-            suggestion.evidence.join("、")
+            upgrade.kind,
+            upgrade.effort,
+            upgrade.confidence,
+            upgrade.evidence.join("、")
         ));
-        if !suggestion.why.trim().is_empty() {
-            lines.push(format!("- 为什么：{}", suggestion.why.trim()));
+        if !upgrade.habit.trim().is_empty() {
+            lines.push(format!("- 接上你现在：{}", upgrade.habit.trim()));
         }
-        lines.push("- 怎么做：".to_owned());
-        for (step, action) in suggestion.actions.iter().enumerate() {
+        if !upgrade.problem.trim().is_empty() {
+            lines.push(format!("- 现状：{}", upgrade.problem.trim()));
+        }
+        if !upgrade.alternative.trim().is_empty() {
+            lines.push(format!("- 替换：{}", upgrade.alternative.trim()));
+        }
+        lines.push("- 怎么开始：".to_owned());
+        for (step, action) in upgrade.actions.iter().enumerate() {
             lines.push(format!("    {}. {action}", step + 1));
         }
-        if !suggestion.when.trim().is_empty() {
-            lines.push(format!("- 何时：{}", suggestion.when.trim()));
+        if !upgrade.payoff.trim().is_empty() {
+            lines.push(format!("- 预期：{}", upgrade.payoff.trim()));
         }
-        if !suggestion.expected.trim().is_empty() {
-            lines.push(format!("- 预期：{}", suggestion.expected.trim()));
+        if !upgrade.risk.trim().is_empty() {
+            lines.push(format!("- 风险：{}", upgrade.risk.trim()));
         }
-        for tool in &suggestion.tools {
+        for tool in &upgrade.tools {
             if let Some(item) = recommendations.iter().find(|item| &item.id == tool) {
                 for resource in &item.resources {
                     lines.push(format!(
@@ -481,36 +549,42 @@ pub fn render_markdown(
                 }
             }
         }
-        if !suggestion.unverified_numbers.is_empty() {
+        if !upgrade.unverified_numbers.is_empty() {
             lines.push(format!(
                 "> 注意：数字 {} 无法在记录中核实。",
-                suggestion.unverified_numbers.join("、")
+                upgrade.unverified_numbers.join("、")
             ));
         }
     }
 
-    if let Some(experiment) = &advice.experiment {
-        let def = metric_def(&experiment.metric);
-        let (label, unit) = def.map(|def| (def.label, def.unit)).unwrap_or(("指标", ""));
-        lines.extend([String::new(), "## 明日实验".to_owned()]);
-        lines.push(format!("- 假设：{}", experiment.hypothesis.trim()));
-        lines.push(format!("- 做法：{}", experiment.action.trim()));
-        lines.push(format!(
-            "- 衡量：{label} 从今天的 {}{unit} {}到 {}{unit}。下一份建议会自动核对结果。",
-            experiment.baseline.map(fmt_number).unwrap_or_default(),
-            if experiment.wants_increase() {
-                "提高"
-            } else {
-                "降低"
-            },
-            fmt_number(experiment.target)
-        ));
+    if !advice.watch.is_empty() {
+        lines.extend([String::new(), "## 下次会自动核对".to_owned()]);
+        lines.push("这些指标不需要你做任何事，下次生成时会自动对照。".to_owned());
+        for watch in &advice.watch {
+            let def = metric_def(&watch.metric);
+            let (label, unit) = def.map(|def| (def.label, def.unit)).unwrap_or(("指标", ""));
+            lines.push(format!(
+                "- {label}：今天 {}{unit}。{}",
+                fmt_number(watch.baseline.unwrap_or_default()),
+                watch.reason.trim()
+            ));
+        }
+    }
+
+    if !advice.filtered.is_empty() {
+        lines.extend([
+            String::new(),
+            format!(
+                "> 已过滤 {} 条要求改变习惯的内容；这份报告只保留能让现有动作更省力的工具建议。",
+                advice.filtered.len()
+            ),
+        ]);
     }
 
     let used = advice
-        .suggestions
+        .upgrades
         .iter()
-        .flat_map(|suggestion| suggestion.tools.iter())
+        .flat_map(|upgrade| upgrade.tools.iter())
         .collect::<BTreeSet<_>>();
     let unused = recommendations
         .iter()
@@ -521,6 +595,9 @@ pub fn render_markdown(
         for item in unused {
             lines.push(format!("### {}", item.title));
             lines.push(format!("- 依据：{}", item.evidence));
+            if !item.replaces.is_empty() {
+                lines.push(format!("- 可替代：{}", item.replaces.join("、")));
+            }
             for resource in &item.resources {
                 lines.push(format!(
                     "- [{}]({})（{}）{}",
@@ -529,6 +606,7 @@ pub fn render_markdown(
             }
         }
     }
+
     if search.enabled {
         lines.push(format!(
             "> 联网检索：{} 次抽象关键词查询，新增 {} 个候选，验证 {} 个链接；搜索服务不会收到行为数据。",
@@ -544,7 +622,6 @@ pub fn render_markdown(
     lines.push("工具只供人工评估，TraceBit 不会自动下载、安装或启用。".to_owned());
     lines.join("\n")
 }
-
 #[derive(Debug)]
 pub struct Analyzer {
     settings: Arc<Settings>,
@@ -641,28 +718,160 @@ impl Analyzer {
             .collect()
     }
 
-    /// Scores the most recent earlier experiment against today's metrics.
-    fn review_previous(&self, date_key: &str, metrics: &DayMetrics) -> Option<ExperimentReview> {
-        let date = NaiveDate::parse_from_str(date_key, "%Y-%m-%d").ok()?;
-        (1..=HISTORY_DAYS).find_map(|offset| {
-            let key = (date - ChronoDuration::days(offset))
+    /// Score-free picture of how this person works, stored next to the reports.
+    fn profile_path(&self) -> PathBuf {
+        self.reports_dir
+            .parent()
+            .map(|parent| parent.join("profile.json"))
+            .unwrap_or_else(|| self.reports_dir.join("profile.json"))
+    }
+
+    pub fn profile(&self) -> Profile {
+        Profile::load(&self.profile_path())
+    }
+
+    fn digest_path(&self) -> PathBuf {
+        self.reports_dir
+            .parent()
+            .map(|parent| parent.join("digest.json"))
+            .unwrap_or_else(|| self.reports_dir.join("digest.json"))
+    }
+
+    /// Local date whose digest was already delivered.
+    pub fn last_digest(&self) -> Option<String> {
+        crate::digest::DigestState::load(&self.digest_path()).last_sent
+    }
+
+    pub fn mark_digest_sent(&self, date_key: &str) -> Result<()> {
+        validate_date_key(date_key)?;
+        let path = self.digest_path();
+        let mut state = crate::digest::DigestState::load(&path);
+        state.last_sent = Some(date_key.to_owned());
+        state.save(&path)
+    }
+
+    /// Whether a day has enough recorded activity to be worth a notification.
+    pub fn has_activity(&self, date_key: &str) -> bool {
+        self.store
+            .day_stats(date_key, self.options())
+            .is_ok_and(|stats| stats.total_active_ms >= 30 * 60_000)
+    }
+
+    /// Records this day in the profile and persists it.
+    pub fn observe_profile(&self, date_key: &str) -> Result<Profile> {
+        validate_date_key(date_key)?;
+        let stats = self.store.day_stats(date_key, self.options())?;
+        let mut profile = self.profile();
+        profile.observe(date_key, &stats);
+        profile.save(&self.profile_path())?;
+        Ok(profile)
+    }
+
+    /// Learns every recorded day in the recent past. Runs once when the app
+    /// starts, so the profile is useful immediately instead of after N reports.
+    /// Days already in the profile are not recomputed.
+    pub fn backfill_profile(&self, days: i64) -> usize {
+        let mut profile = self.profile();
+        let today = chrono::Local::now().date_naive();
+        let mut learned = 0;
+        for offset in 0..days.max(0) {
+            let key = (today - ChronoDuration::days(offset))
                 .format("%Y-%m-%d")
                 .to_string();
-            let experiment = self.get_report(&key)?.advice?.experiment?;
-            let actual = metrics.get(&experiment.metric);
-            let achieved = actual.map(|actual| {
-                if experiment.wants_increase() {
-                    actual >= experiment.target
+            if profile.days.contains_key(&key) {
+                continue;
+            }
+            let Ok(stats) = self.store.day_stats(&key, self.options()) else {
+                continue;
+            };
+            if stats.total_active_ms < 5 * 60_000 {
+                continue;
+            }
+            if profile.observe(&key, &stats) {
+                learned += 1;
+            }
+        }
+        if learned > 0 {
+            let _ = profile.save(&self.profile_path());
+        }
+        learned
+    }
+
+    /// Marks a tool candidate as adopted or not needed. The next report compares
+    /// the same workflow automatically; nothing else is required from the user.
+    pub fn decide(
+        &self,
+        date_key: &str,
+        opportunity: &str,
+        resource: &str,
+        url: &str,
+        adopted: bool,
+    ) -> Result<Profile> {
+        validate_date_key(date_key)?;
+        let stats = self.store.day_stats(date_key, self.options())?;
+        let recommendations = build_recommendations(&stats);
+        let Some(item) = recommendations.iter().find(|item| item.id == opportunity) else {
+            bail!("找不到这个工具候选");
+        };
+        let mut profile = self.profile();
+        profile.record(Decision {
+            opportunity: item.id.clone(),
+            title: item.title.clone(),
+            resource: resource.to_owned(),
+            url: url.to_owned(),
+            date_key: date_key.to_owned(),
+            kind: Some(if adopted {
+                DecisionKind::Adopted
+            } else {
+                DecisionKind::Dismissed
+            }),
+            evidence: item.evidence.clone(),
+        });
+        profile.save(&self.profile_path())?;
+        Ok(profile)
+    }
+
+    /// Before / after for the most recent adopted tools.
+    fn review_adoptions(
+        &self,
+        profile: &Profile,
+        recommendations: &[Recommendation],
+    ) -> Vec<AdoptionReview> {
+        let mut reviews = profile
+            .adopted()
+            .into_iter()
+            .rev()
+            .take(2)
+            .map(|decision| AdoptionReview {
+                title: decision.title.clone(),
+                resource: if decision.resource.trim().is_empty() {
+                    decision.title.clone()
                 } else {
-                    actual <= experiment.target
-                }
-            });
-            Some(ExperimentReview {
-                experiment,
-                actual,
-                achieved,
+                    decision.resource.clone()
+                },
+                date_key: decision.date_key.clone(),
+                before: decision.evidence.clone(),
+                after: recommendations
+                    .iter()
+                    .find(|item| item.id == decision.opportunity)
+                    .map(|item| item.evidence.clone()),
             })
-        })
+            .collect::<Vec<_>>();
+        reviews.reverse();
+        reviews
+    }
+
+    fn profile_evidence(snapshot: &ProfileSnapshot) -> Vec<Evidence> {
+        snapshot
+            .lines()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (kind, text))| Evidence {
+                id: format!("P{}", index + 1),
+                kind: kind.to_owned(),
+                text,
+            })
+            .collect()
     }
 
     fn summaries(&self, date_key: &str) -> Vec<Evidence> {
@@ -698,31 +907,42 @@ impl Analyzer {
             .map(|(stats, metrics)| History { stats, metrics })
             .collect::<Vec<_>>();
         let mut evidence = build_evidence(&stats, &metrics, &history);
-        let review = self.review_previous(date_key, &metrics);
-        if let Some(review) = &review {
-            evidence.push(Evidence {
-                id: format!("E{}", evidence.len() + 1),
-                kind: "experiment".to_owned(),
-                text: review_text(review),
-            });
-        }
+
+        // Today is folded in memory so a preview shows exactly what generation
+        // would send; generation stores the same state right after.
+        let mut profile = self.profile();
+        profile.observe(date_key, &stats);
+        let snapshot = profile.snapshot();
+        let profile_evidence = Self::profile_evidence(&snapshot);
+
         let summaries = self.summaries(date_key);
-        let recommendations = build_recommendations(&stats);
+        let all_recommendations = build_recommendations(&stats);
+        let adoptions = self.review_adoptions(&profile, &all_recommendations);
+        let dismissed = profile.dismissed();
+        let mut recommendations = all_recommendations
+            .into_iter()
+            .filter(|item| !dismissed.contains(&item.id))
+            .collect::<Vec<_>>();
+        recommendations.truncate(MAX_OPPORTUNITIES);
         let user_prompt = build_user_prompt(
             date_key,
             &metrics,
             &evidence,
             &summaries,
+            &profile_evidence,
             &recommendations,
-            review.as_ref(),
+            &profile.decisions_for_prompt(),
+            &adoptions,
         );
         evidence.extend(summaries);
+        evidence.extend(profile_evidence);
         Ok(AdviceContext {
             stats,
             metrics,
             evidence,
             recommendations,
-            review,
+            profile: snapshot,
+            adoptions,
             system_prompt: SYSTEM_PROMPT.to_owned(),
             user_prompt,
         })
@@ -744,6 +964,9 @@ impl Analyzer {
     pub fn generate_report_as(&self, date_key: &str, source: &str) -> Result<Report> {
         let ai = self.settings.get().ai;
         let endpoint = ai.text_endpoint();
+        // Learn this day even if the model call fails: the profile is just an
+        // observation, not a generated artifact.
+        self.observe_profile(date_key)?;
         let context = self.build_context(date_key)?;
         if context.stats.events == 0 {
             bail!("当天没有记录数据");
@@ -799,14 +1022,7 @@ impl Analyzer {
                 known.insert(fmt_number(value));
             }
         }
-        let advice = validate_advice(
-            advice,
-            &evidence_ids,
-            &tool_ids,
-            &known,
-            &context.metrics,
-            date_key,
-        )?;
+        let advice = validate_advice(advice, &evidence_ids, &tool_ids, &known, &context.metrics)?;
         let enriched = enrich_recommendations(&context.recommendations, &ai);
         let markdown = render_markdown(
             date_key,
@@ -815,7 +1031,7 @@ impl Analyzer {
             &context.evidence,
             &enriched.recommendations,
             &enriched.search,
-            context.review.as_ref(),
+            &context.adoptions,
         );
         let input_hash = format!(
             "{:x}",
@@ -838,7 +1054,8 @@ impl Analyzer {
             advice: Some(advice),
             evidence: context.evidence,
             metrics: Some(context.metrics),
-            review: context.review,
+            profile: Some(context.profile),
+            adoptions: context.adoptions,
             source: source.to_owned(),
             prompt_version: PROMPT_VERSION.to_owned(),
             input_hash,
@@ -897,7 +1114,7 @@ impl Analyzer {
 fn parse_advice(content: &str) -> Option<Advice> {
     let value = llm::extract_json_object(content)?;
     let advice: Advice = serde_json::from_value(value).ok()?;
-    (!advice.suggestions.is_empty()).then_some(advice)
+    (!advice.upgrades.is_empty()).then_some(advice)
 }
 
 /// Local time of day "HH:MM" on `date_key`, as epoch milliseconds.
@@ -961,29 +1178,60 @@ mod tests {
             .unwrap();
     }
 
+    fn analyzer_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (Arc<Settings>, Arc<DayStore>, Analyzer, String, i64) {
+        let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
+        let settings = Arc::new(Settings::load(temp.path().join("user")));
+        let (date_key, noon) = noon();
+        seed(&store, noon);
+        let analyzer =
+            Analyzer::new(settings.clone(), store.clone(), temp.path().join("reports")).unwrap();
+        (settings, store, analyzer, date_key, noon)
+    }
+
     fn advice_json() -> String {
         json!({
-            "headline": "把 git 操作留在一个窗口里",
-            "diagnosis": [
-                {"finding": "编辑器和终端来回切换，根因是 git 操作分散", "evidence": ["E1", "E99"]},
-                {"finding": "这条没有证据", "evidence": []}
+            "headline": "你在编辑器和终端之间完成开发，来回主要来自 git 操作",
+            "reading": [
+                {"observation": "开发工作集中在 VS Code 和 PowerShell 之间", "evidence": ["E1", "E99"], "confidence": "高"},
+                {"observation": "没有证据的观察", "evidence": [], "confidence": "低"}
             ],
-            "suggestions": [
+            "upgrades": [
                 {
-                    "title": "用 lazygit 集中处理提交",
+                    "title": "用 lazygit 处理提交",
                     "type": "工具",
                     "evidence": ["E1"],
-                    "why": "每天切换 999 次",
+                    "habit": "你每天在终端里跑 git 命令",
+                    "problem": "每天来回切换 999 次",
                     "actions": ["安装 lazygit", "在终端里固定一个标签页"],
-                    "when": "明早开始写代码前",
-                    "expected": "减少一半切换",
+                    "payoff": "同样的提交在原窗口完成",
+                    "risk": "改写历史的操作仍需确认",
+                    "alternative": "",
                     "effort": "低",
                     "confidence": "中",
                     "tools": ["development-loop", "made-up-tool"]
                 },
+                {
+                    "title": "定时集中回复消息",
+                    "type": "配置",
+                    "evidence": ["E1"],
+                    "habit": "你已经被打断很多次",
+                    "problem": "打断太多",
+                    "actions": ["关闭通知"],
+                    "payoff": "",
+                    "risk": "",
+                    "alternative": "",
+                    "effort": "低",
+                    "confidence": "中",
+                    "tools": []
+                },
                 {"title": "没有证据的建议", "evidence": ["E77"], "actions": ["x"]}
             ],
-            "experiment": {"hypothesis": "集中 git 操作能减少切换", "action": "只在 lazygit 里提交", "metric": "switches_per_hour", "target": 5},
+            "watch": [
+                {"metric": "switches_per_hour", "reason": "观察工具是否让来回变少"},
+                {"metric": "not_a_metric", "reason": "x"}
+            ],
             "followup": ""
         })
         .to_string()
@@ -993,14 +1241,10 @@ mod tests {
     fn advice_end_to_end_is_grounded_redacted_and_persisted() {
         let (url, rx) = mock::serve(vec![mock::completion("mock-model", &advice_json())]);
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
-        let settings = Arc::new(Settings::load(temp.path().join("user")));
+        let (settings, _store, analyzer, date_key, _) = analyzer_fixture(&temp);
         settings
             .patch(&json!({"ai": {"baseUrl": url, "apiKey":"mock-key", "model":"mock-model", "webSearch":false}}))
             .unwrap();
-        let (date_key, noon) = noon();
-        seed(&store, noon);
-        let analyzer = Analyzer::new(settings, store, temp.path().join("reports")).unwrap();
         let report = analyzer.generate_report(&date_key).unwrap();
         let request = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert!(request.contains("Bearer mock-key"));
@@ -1008,27 +1252,44 @@ mod tests {
         assert!(!request.contains("secret@example.com"));
         assert!(!request.contains("private.example.com"));
         assert!(request.contains("development-loop"));
+        assert!(request.contains("长期工作画像"));
 
         let advice = report.advice.as_ref().unwrap();
-        assert_eq!(advice.diagnosis.len(), 1);
-        assert_eq!(advice.diagnosis[0].evidence, vec!["E1"]);
-        assert_eq!(advice.suggestions.len(), 1);
-        assert_eq!(advice.suggestions[0].tools, vec!["development-loop"]);
-        assert_eq!(advice.suggestions[0].unverified_numbers, vec!["999"]);
-        let experiment = advice.experiment.as_ref().unwrap();
-        assert!(experiment.baseline.is_some());
-        assert_eq!(experiment.date_key, date_key);
-        assert!(report.markdown.contains("## 建议"));
+        assert_eq!(advice.reading.len(), 1);
+        assert_eq!(advice.reading[0].evidence, vec!["E1"]);
+        assert_eq!(advice.upgrades.len(), 1);
+        assert_eq!(advice.upgrades[0].tools, vec!["development-loop"]);
+        assert_eq!(advice.upgrades[0].unverified_numbers, vec!["999"]);
+        assert_eq!(advice.filtered, vec!["定时集中回复消息"]);
+        assert_eq!(advice.watch.len(), 1);
+        assert_eq!(advice.watch[0].metric, "switches_per_hour");
+        assert!(advice.watch[0].baseline.is_some());
+        assert!(report.markdown.contains("## 工具升级机会"));
+        assert!(report.markdown.contains("## 你的工作方式"));
         assert!(report.markdown.contains("lazygit"));
-        assert!(report.markdown.contains("## 明日实验"));
+        assert!(report.markdown.contains("已过滤"));
         assert_eq!(report.prompt_version, PROMPT_VERSION);
         assert_eq!(report.usage.prompt_tokens, 100);
         assert!(!report.input_hash.is_empty());
+        let profile = report.profile.as_ref().unwrap();
+        assert_eq!(profile.days, 1);
+        assert!(profile.tools.iter().any(|tool| tool.name == "VS Code"));
         assert!(analyzer.get_report(&date_key).is_some());
-        let html = fs::read_to_string(temp.path().join("reports").join(format!("{date_key}.html"))).unwrap();
-        assert!(html.contains("用 lazygit 集中处理提交"));
-        assert!(html.contains("明日实验"));
+        assert!(temp.path().join("profile.json").is_file());
+        let html = fs::read_to_string(temp.path().join("reports").join(format!("{date_key}.html")))
+            .unwrap();
+        assert!(html.contains("用 lazygit 处理提交"));
+        assert!(html.contains("工具升级机会"));
+        assert!(html.contains("工作方式"));
         assert!(!html.contains("<script"));
+    }
+
+    #[test]
+    fn guard_matches_behavior_requests_not_cost_descriptions() {
+        assert!(pushes_behavior("定时集中回复消息"));
+        assert!(pushes_behavior("安装插件 关闭通知"));
+        assert!(!pushes_behavior("把常用命令写成任务入口"));
+        assert!(!pushes_behavior("现状是每天来回切换 12 次"));
     }
 
     #[test]
@@ -1038,14 +1299,10 @@ mod tests {
             mock::completion("m", &advice_json()),
         ]);
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
-        let settings = Arc::new(Settings::load(temp.path().join("user")));
+        let (settings, _store, analyzer, date_key, _) = analyzer_fixture(&temp);
         settings
             .patch(&json!({"ai": {"baseUrl": url, "model":"m"}}))
             .unwrap();
-        let (date_key, noon) = noon();
-        seed(&store, noon);
-        let analyzer = Analyzer::new(settings, store, temp.path().join("reports")).unwrap();
         let report = analyzer.generate_report(&date_key).unwrap();
         let _ = rx.recv().unwrap();
         let repair = rx.recv().unwrap();
@@ -1054,73 +1311,55 @@ mod tests {
     }
 
     #[test]
-    fn previous_experiment_is_scored_automatically() {
+    fn adopted_and_dismissed_tools_change_the_next_prompt() {
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
-        let settings = Arc::new(Settings::load(temp.path().join("user")));
-        let (date_key, noon) = noon();
-        seed(&store, noon);
-        let analyzer = Analyzer::new(settings, store.clone(), temp.path().join("reports")).unwrap();
-        let previous = (NaiveDate::parse_from_str(&date_key, "%Y-%m-%d").unwrap()
-            - ChronoDuration::days(1))
-        .format("%Y-%m-%d")
-        .to_string();
-        let report = Report {
-            date_key: previous.clone(),
-            markdown: String::new(),
-            model: "m".to_owned(),
-            generated_at: 0,
-            active_minutes: 0,
-            switch_count: 0,
-            app_count: 0,
-            recommendation_count: 0,
-            recommendations: vec![],
-            resource_search: SearchSummary::default(),
-            advice: Some(Advice {
-                experiment: Some(Experiment {
-                    action: "关掉通知".to_owned(),
-                    metric: "deep_work_min".to_owned(),
-                    target: 20.0,
-                    baseline: Some(5.0),
-                    date_key: previous.clone(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            evidence: vec![],
-            metrics: None,
-            review: None,
-            source: "manual".to_owned(),
-            prompt_version: String::new(),
-            input_hash: String::new(),
-            usage: Usage::default(),
-        };
-        fs::write(
-            analyzer.report_file(&previous).unwrap(),
-            serde_json::to_vec(&report).unwrap(),
-        )
-        .unwrap();
+        let (_settings, _store, analyzer, date_key, _) = analyzer_fixture(&temp);
+        let profile = analyzer
+            .decide(
+                &date_key,
+                "development-loop",
+                "lazygit",
+                "https://github.com/jesseduffield/lazygit",
+                true,
+            )
+            .unwrap();
+        assert_eq!(profile.adopted().len(), 1);
         let context = analyzer.build_context(&date_key).unwrap();
-        let review = context.review.unwrap();
-        assert_eq!(review.achieved, Some(true), "{review:?}");
-        assert!(context.user_prompt.contains("上次实验"));
-        assert!(context.user_prompt.contains("已达成"));
+        assert!(!context.adoptions.is_empty());
+        assert!(context.user_prompt.contains("采纳回看"));
+        assert!(context.user_prompt.contains("lazygit"));
+        assert!(context.user_prompt.contains("已采纳"));
+
+        analyzer
+            .decide(&date_key, "development-loop", "lazygit", "", false)
+            .unwrap();
+        let context = analyzer.build_context(&date_key).unwrap();
         assert!(
             context
-                .evidence
+                .recommendations
                 .iter()
-                .any(|item| item.kind == "experiment")
+                .all(|item| item.id != "development-loop")
         );
+        assert!(context.user_prompt.contains("不要再次推荐"));
+    }
+
+    #[test]
+    fn regeneration_does_not_duplicate_the_profile_day() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_settings, _store, analyzer, date_key, _) = analyzer_fixture(&temp);
+        analyzer.observe_profile(&date_key).unwrap();
+        analyzer.observe_profile(&date_key).unwrap();
+        let profile = analyzer.profile();
+        assert_eq!(profile.days.len(), 1);
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.days, 1);
+        assert!(snapshot.rhythm.active_hours > 0);
     }
 
     #[test]
     fn auto_report_never_overwrites_manual_and_refreshes_stale_auto() {
         let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
-        let settings = Arc::new(Settings::load(temp.path().join("user")));
-        let (date_key, noon) = noon();
-        seed(&store, noon);
-        let analyzer = Analyzer::new(settings, store, temp.path().join("reports")).unwrap();
+        let (_settings, _store, analyzer, date_key, noon) = analyzer_fixture(&temp);
         assert!(analyzer.needs_auto_report(&date_key, 0));
         let mut report: Report = serde_json::from_value(json!({
             "dateKey": date_key, "markdown": "", "model": "m", "generatedAt": noon,

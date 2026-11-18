@@ -1,11 +1,13 @@
 pub mod analyzer;
 pub mod app;
 pub mod categories;
+pub mod digest;
 pub mod input;
 pub mod insights;
 pub mod intervals;
 pub mod llm;
 pub mod platform;
+pub mod profile;
 pub mod recommendations;
 pub mod recorder;
 pub mod redact;

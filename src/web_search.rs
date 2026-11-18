@@ -498,6 +498,7 @@ mod tests {
             evidence: "4 次".to_owned(),
             summary: "Test".to_owned(),
             search_query: "abstract tools".to_owned(),
+            replaces: vec![],
             score: 1.0,
             resources: vec![],
         };

@@ -118,6 +118,9 @@ pub struct AiSettings {
     pub model: String,
     pub auto_report: bool,
     pub auto_report_time: String,
+    /// Send yesterday's advice as a system notification once a day.
+    pub daily_digest: bool,
+    pub daily_digest_time: String,
     pub screenshot_analysis: bool,
     pub screenshot_analysis_interval_ms: u64,
     pub web_search: bool,
@@ -137,6 +140,8 @@ impl Default for AiSettings {
             model: String::new(),
             auto_report: false,
             auto_report_time: "21:30".to_owned(),
+            daily_digest: true,
+            daily_digest_time: "10:30".to_owned(),
             screenshot_analysis: false,
             screenshot_analysis_interval_ms: 30 * 60_000,
             web_search: false,
@@ -326,6 +331,8 @@ mod tests {
         assert!(!settings.recording.browser_sites);
         assert!(!settings.ai.web_search);
         assert!(!settings.ai.auto_report);
+        assert!(settings.ai.daily_digest);
+        assert_eq!(settings.ai.daily_digest_time, "10:30");
         assert!(!settings.ai.screenshot_analysis);
         assert_eq!(settings.ai.screenshot_analysis_interval_ms, 30 * 60_000);
         assert_eq!(settings.storage.max_snapshot_bytes, 2 * 1024 * 1024 * 1024);

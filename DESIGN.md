@@ -84,3 +84,12 @@ A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber
 - Check the snapshot viewer at both window sizes, including long metadata, first/last image, Escape, and keyboard activation.
 - Check Tab / Shift-Tab, Enter / Space, global shortcuts, destructive confirmations, and second-launch window restoration.
 - Run `cargo test` and `cargo run -- --native-smoke` after collector changes.
+
+## 11. AI advice stance
+- TraceBit learns how the person works; it does not correct it. Reports only propose tools, plugins, settings, automations or open-source alternatives that make an action the person already takes cheaper.
+- Anything that asks for a new habit (cut down, quit, batch replies at fixed times, close notifications, sleep earlier, take breaks, "focus") is dropped by a local guard and counted in the report, not just discouraged in the prompt.
+- The long-term profile is descriptive only: tools and roles, recurring app hops, rhythm, recurring work items, sites. No scores, no labels, no streaks.
+- Explicit feedback is limited to two verbs per candidate: `已用上` and `不需要`. Dismissed candidates never return; adopted tools are re-measured against the same workflow next time.
+- A report never assigns homework. Watched metrics are checked automatically; the user is not asked to run an experiment.
+- A daily digest at a user-set time (default 10:30) restates yesterday's headline and top upgrade with a time-of-day greeting. It is read-only, is skipped when yesterday had no activity, and is delivered at most once per day (catch-up only within the same day).
+- Every claim cites an evidence id (`E` today, `P` profile, `S` screenshot summary). Numbers that cannot be traced are flagged.
