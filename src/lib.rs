@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod app;
 pub mod categories;
 pub mod digest;
+pub mod i18n;
 pub mod input;
 pub mod insights;
 pub mod intervals;

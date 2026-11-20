@@ -5,10 +5,14 @@
 //! not allowed to) invent figures.
 
 use crate::{
-    categories::{is_communication, is_distraction, is_meeting, is_productive},
+    categories::{
+        is_communication, is_distraction, is_meeting, is_productive, label as category_label,
+    },
+    i18n::{Lang, Text, fill},
     recorder::SENSITIVE_TITLE,
-    redact::{ai_title, clean_title},
+    redact::{ai_title, clean_title, display_title},
     store::{CONTIGUOUS_GAP_MS, DayStats, Stay, hhmm, local_datetime},
+    tr,
 };
 use chrono::Timelike;
 use serde::{Deserialize, Serialize};
@@ -34,71 +38,111 @@ pub enum Better {
 
 pub struct MetricDef {
     pub key: &'static str,
-    pub label: &'static str,
-    pub unit: &'static str,
+    pub label: Text,
+    pub unit: Text,
     pub better: Better,
+}
+
+impl MetricDef {
+    pub fn label(&self, lang: Lang) -> &'static str {
+        self.label.get(lang)
+    }
+
+    pub fn unit(&self, lang: Lang) -> &'static str {
+        self.unit.get(lang)
+    }
 }
 
 /// Metrics a report can watch. Keys are part of the AI output contract.
 pub const METRICS: [MetricDef; 10] = [
     MetricDef {
         key: "active_min",
-        label: "活跃时长",
-        unit: "分钟",
+        label: Text::new("活跃时长", "Active time", "アクティブ時間", "활동 시간"),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Neutral,
     },
     MetricDef {
         key: "deep_work_min",
-        label: "深度工作时长",
-        unit: "分钟",
+        label: Text::new(
+            "深度工作时长",
+            "Deep work time",
+            "集中作業時間",
+            "집중 작업 시간",
+        ),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Higher,
     },
     MetricDef {
         key: "deep_blocks",
-        label: "深度工作块",
-        unit: "个",
+        label: Text::new("深度工作块", "Deep work", "集中作業", "집중 작업"),
+        unit: Text::new("个", "blocks", "ブロック", "블록"),
         better: Better::Higher,
     },
     MetricDef {
         key: "switches_per_hour",
-        label: "每小时应用切换",
-        unit: "次",
+        label: Text::new(
+            "每小时应用切换",
+            "App switches per hour",
+            "1時間あたりのアプリ切り替え",
+            "시간당 앱 전환",
+        ),
+        unit: Text::new("次", "times", "回", "회"),
         better: Better::Lower,
     },
     MetricDef {
         key: "comm_checks",
-        label: "打开通讯应用",
-        unit: "次",
+        label: Text::new(
+            "打开通讯应用",
+            "Chat app opens",
+            "チャットアプリの起動",
+            "채팅 앱 실행",
+        ),
+        unit: Text::new("次", "times", "回", "회"),
         better: Better::Lower,
     },
     MetricDef {
         key: "comm_min",
-        label: "通讯时长",
-        unit: "分钟",
+        label: Text::new("通讯时长", "Chat time", "チャット時間", "채팅 시간"),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Neutral,
     },
     MetricDef {
         key: "meeting_min",
-        label: "会议时长",
-        unit: "分钟",
+        label: Text::new("会议时长", "Meeting time", "会議時間", "회의 시간"),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Lower,
     },
     MetricDef {
         key: "distraction_min",
-        label: "娱乐与资讯时长",
-        unit: "分钟",
+        label: Text::new(
+            "娱乐与资讯时长",
+            "Leisure and news",
+            "娯楽・ニュース時間",
+            "엔터테인먼트·뉴스 시간",
+        ),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Lower,
     },
     MetricDef {
         key: "late_min",
-        label: "23 点后活跃",
-        unit: "分钟",
+        label: Text::new(
+            "23 点后活跃",
+            "Active after 23:00",
+            "23時以降の活動",
+            "23시 이후 활동",
+        ),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Lower,
     },
     MetricDef {
         key: "longest_stretch_min",
-        label: "最长连续未休息",
-        unit: "分钟",
+        label: Text::new(
+            "最长连续未休息",
+            "Longest stretch",
+            "最長の連続稼働",
+            "최장 연속 작업",
+        ),
+        unit: Text::new("分钟", "min", "分", "분"),
         better: Better::Lower,
     },
 ];
@@ -428,8 +472,11 @@ pub fn build_evidence(
     stats: &DayStats,
     metrics: &DayMetrics,
     history: &[History<'_>],
+    lang: Lang,
 ) -> Vec<Evidence> {
     let mut out = EvidenceBuilder { items: Vec::new() };
+    let list_sep = tr!(lang, "、", ", ", "、", ", ");
+    let tight_sep = tr!(lang, "；", "; ", "；", "; ");
     let stays = &stats.stays;
     let runs = productive_runs(stays);
     let deep = runs
@@ -440,14 +487,22 @@ pub fn build_evidence(
     // Overview.
     out.push(
         "overview",
-        format!(
-            "活跃 {} 分钟（{}–{}），深度工作（连续产出 ≥25 分钟）{} 分钟、{} 块，每小时切换应用 {} 次。",
-            metrics.active_min,
-            stats.first_active.map(hhmm).unwrap_or_default(),
-            stats.last_active.map(hhmm).unwrap_or_default(),
-            metrics.deep_work_min,
-            metrics.deep_blocks,
-            metrics.switches_per_hour
+        fill(
+            tr!(
+                lang,
+                "活跃 {} 分钟（{}–{}），深度工作（连续产出 ≥25 分钟）{} 分钟、{} 块，每小时切换应用 {} 次。",
+                "Active {} min ({}–{}); deep work (uninterrupted output of 25 min or more) {} min in {} blocks; app switches {} per hour.",
+                "アクティブ {} 分（{}–{}）、集中作業（25 分以上の連続した作業）{} 分・{} ブロック、1時間あたりのアプリ切り替え {} 回。",
+                "활동 {}분({}–{}), 집중 작업(25분 이상 연속 작업) {}분·{}블록, 시간당 앱 전환 {}회."
+            ),
+            &[
+                &metrics.active_min,
+                &stats.first_active.map(hhmm).unwrap_or_default(),
+                &stats.last_active.map(hhmm).unwrap_or_default(),
+                &metrics.deep_work_min,
+                &metrics.deep_blocks,
+                &metrics.switches_per_hour,
+            ],
         ),
     );
 
@@ -458,16 +513,36 @@ pub fn build_evidence(
         .iter()
         .take(7)
         .map(|category| {
-            format!(
-                "{} {} 分钟（{}%）",
-                category.name,
-                minutes(category.ms),
-                (category.ms as f64 / total * 100.0).round()
+            fill(
+                tr!(
+                    lang,
+                    "{} {} 分钟（{}%）",
+                    "{} {} min ({}%)",
+                    "{} {} 分（{}%）",
+                    "{} {}분({}%)"
+                ),
+                &[
+                    &category_label(lang, &category.name),
+                    &minutes(category.ms),
+                    &(category.ms as f64 / total * 100.0).round(),
+                ],
             )
         })
         .collect::<Vec<_>>();
     if !mix.is_empty() {
-        out.push("mix", format!("时间构成：{}。", mix.join("、")));
+        out.push(
+            "mix",
+            fill(
+                tr!(
+                    lang,
+                    "时间构成：{}。",
+                    "Time mix: {}.",
+                    "時間の内訳：{}。",
+                    "시간 구성: {}."
+                ),
+                &[&mix.join(list_sep)],
+            ),
+        );
     }
 
     // What the time actually went into.
@@ -482,15 +557,36 @@ pub fn build_evidence(
                 .find(|stay| &stay.app == app)
                 .map(category_of)
                 .unwrap_or("其他");
-            format!(
-                "{app}「{}」{} 分钟",
-                ai_title(category, title),
-                minutes(*ms)
+            fill(
+                tr!(
+                    lang,
+                    "{0}「{1}」{2} 分钟",
+                    "{0} “{1}” {2} min",
+                    "{0}「{1}」{2} 分",
+                    "{0} “{1}” {2}분"
+                ),
+                &[
+                    app,
+                    &display_title(lang, &ai_title(category, title)),
+                    &minutes(*ms),
+                ],
             )
         })
         .collect::<Vec<_>>();
     if !top.is_empty() {
-        out.push("content", format!("耗时最多的窗口：{}。", top.join("；")));
+        out.push(
+            "content",
+            fill(
+                tr!(
+                    lang,
+                    "耗时最多的窗口：{}。",
+                    "Top windows by time: {}.",
+                    "時間が最も長いウィンドウ：{}。",
+                    "시간을 가장 많이 쓴 창: {}."
+                ),
+                &[&top.join(tight_sep)],
+            ),
+        );
     }
 
     // Deep work blocks and when they happen.
@@ -499,9 +595,15 @@ pub fn build_evidence(
         if metrics.active_min >= 60.0 {
             out.push(
                 "deep_work",
-                format!(
-                    "全天没有达到 25 分钟的连续产出段；最长一段连续产出 {} 分钟。",
-                    minutes(longest)
+                fill(
+                    tr!(
+                        lang,
+                        "全天没有达到 25 分钟的连续产出段；最长一段连续产出 {} 分钟。",
+                        "No continuous output block reached 25 minutes today; the longest was {} min.",
+                        "この日は 25 分以上続く作業ブロックがありませんでした。最長の連続作業は {} 分です。",
+                        "오늘 25분 이상 이어진 작업 구간이 없었습니다. 가장 긴 연속 작업은 {}분입니다."
+                    ),
+                    &[&minutes(longest)],
                 ),
             );
         }
@@ -510,17 +612,37 @@ pub fn build_evidence(
             .iter()
             .take(5)
             .map(|run| {
-                format!(
-                    "{}–{}（{} 分钟，{}，期间被打断 {} 次）",
-                    hhmm(run.start),
-                    hhmm(run.end),
-                    minutes(run.productive_ms),
-                    run.main_app,
-                    run.interruptions
+                fill(
+                    tr!(
+                        lang,
+                        "{}–{}（{} 分钟，{}，期间被打断 {} 次）",
+                        "{}–{} ({} min, {}, interrupted {} times)",
+                        "{}–{}（{} 分、{}、中断 {} 回）",
+                        "{}–{} ({}분, {}, 중단 {}회)"
+                    ),
+                    &[
+                        &hhmm(run.start),
+                        &hhmm(run.end),
+                        &minutes(run.productive_ms),
+                        &run.main_app,
+                        &run.interruptions,
+                    ],
                 )
             })
             .collect::<Vec<_>>();
-        out.push("deep_work", format!("深度工作块：{}。", blocks.join("；")));
+        out.push(
+            "deep_work",
+            fill(
+                tr!(
+                    lang,
+                    "深度工作块：{}。",
+                    "Deep work blocks: {}.",
+                    "集中作業ブロック：{}。",
+                    "집중 작업 블록: {}."
+                ),
+                &[&blocks.join(tight_sep)],
+            ),
+        );
     }
 
     // Ping-pong between two apps.
@@ -565,9 +687,21 @@ pub fn build_evidence(
         };
         out.push(
             "ping_pong",
-            format!(
-                "{first} 与 {second} 之间直接来回切换 {count} 次；每次进入 {short_app} 的停留中位数 {} 秒。",
-                (short_ms as f64 / 1000.0).round()
+            fill(
+                tr!(
+                    lang,
+                    "{0} 与 {1} 之间直接来回切换 {2} 次；每次进入 {3} 的停留中位数 {4} 秒。",
+                    "Switched directly between {0} and {1} {2} times; the median stay in {3} was {4} seconds.",
+                    "{0} と {1} の間を直接往復 {2} 回。{3} に入ったときの滞在時間の中央値は {4} 秒です。",
+                    "{0}와 {1} 사이를 {2}회 직접 오갔습니다. {3} 체류 시간 중앙값은 {4}초입니다."
+                ),
+                &[
+                    &first,
+                    &second,
+                    &count,
+                    short_app,
+                    &(short_ms as f64 / 1000.0).round(),
+                ],
             ),
         );
     }
@@ -593,15 +727,30 @@ pub fn build_evidence(
             .iter()
             .take(2)
             .map(|(hour, count)| {
-                format!(
-                    "{hour} 点（活跃 {} 分钟内切换 {count} 次）",
-                    minutes(stats.hourly[*hour])
+                fill(
+                    tr!(
+                        lang,
+                        "{0} 点（活跃 {1} 分钟内切换 {2} 次）",
+                        "{0}:00 ({1} min active, {2} switches)",
+                        "{0} 時（アクティブ {1} 分で切り替え {2} 回）",
+                        "{0}시(활동 {1}분 동안 전환 {2}회)"
+                    ),
+                    &[hour, &minutes(stats.hourly[*hour]), count],
                 )
             })
             .collect::<Vec<_>>();
         out.push(
             "fragmentation",
-            format!("最碎片化的时段：{}。", text.join("、")),
+            fill(
+                tr!(
+                    lang,
+                    "最碎片化的时段：{}。",
+                    "Most fragmented hours: {}.",
+                    "最も細切れになった時間帯：{}。",
+                    "가장 파편화된 시간대: {}."
+                ),
+                &[&text.join(list_sep)],
+            ),
         );
     }
 
@@ -625,11 +774,22 @@ pub fn build_evidence(
         let peak = (0..24).max_by_key(|hour| by_hour[*hour]).unwrap_or(0);
         out.push(
             "communication",
-            format!(
-                "打开通讯应用 {} 次，共 {} 分钟；其中 {quick} 次不足 1 分钟，{inside_runs} 次发生在产出段中途；最频繁的是 {peak} 点（{} 次）。",
-                comm.len(),
-                metrics.comm_min,
-                by_hour[peak]
+            fill(
+                tr!(
+                    lang,
+                    "打开通讯应用 {0} 次，共 {1} 分钟；其中 {2} 次不足 1 分钟，{3} 次发生在产出段中途；最频繁的是 {4} 点（{5} 次）。",
+                    "Opened chat apps {0} times for {1} min in total; {2} of them under a minute, {3} in the middle of a productive run; busiest around {4}:00 ({5} times).",
+                    "チャットアプリを {0} 回開き、合計 {1} 分。うち {2} 回は 1 分未満、{3} 回は作業ブロックの途中でした。最も多かったのは {4} 時（{5} 回）です。",
+                    "채팅 앱을 {0}회 열어 총 {1}분이었습니다. 그중 {2}회는 1분 미만, {3}회는 작업 구간 도중이었습니다. 가장 잦은 시간은 {4}시({5}회)입니다."
+                ),
+                &[
+                    &comm.len(),
+                    &metrics.comm_min,
+                    &quick,
+                    &inside_runs,
+                    &peak,
+                    &by_hour[peak],
+                ],
             ),
         );
     }
@@ -653,13 +813,22 @@ pub fn build_evidence(
             .collect::<Vec<_>>();
         out.push(
             "meetings",
-            format!(
-                "会议 {} 段共 {} 分钟（{}）；{back_to_back} 处首尾间隔不足 10 分钟；会议之间夹着 {} 段 10–40 分钟的碎片时间，共 {} 分钟。",
-                meetings.len(),
-                metrics.meeting_min,
-                list.join("、"),
-                fragments.len(),
-                minutes(fragments.iter().sum())
+            fill(
+                tr!(
+                    lang,
+                    "会议 {0} 段共 {1} 分钟（{2}）；{3} 处首尾间隔不足 10 分钟；会议之间夹着 {4} 段 10–40 分钟的碎片时间，共 {5} 分钟。",
+                    "{0} meeting blocks totalling {1} min ({2}); {3} of them back-to-back with under 10 min between; {4} gaps of 10–40 min totalling {5} min.",
+                    "会議 {0} 件・合計 {1} 分（{2}）。{3} 件は間隔が 10 分未満です。会議の間に 10〜40 分の断片時間が {4} 回、合計 {5} 分あります。",
+                    "회의 {0}건, 총 {1}분({2}). {3}건은 간격이 10분 미만입니다. 회의 사이에 10~40분의 자투리 시간이 {4}번, 총 {5}분 있습니다."
+                ),
+                &[
+                    &meetings.len(),
+                    &metrics.meeting_min,
+                    &list.join(list_sep),
+                    &back_to_back,
+                    &fragments.len(),
+                    &minutes(fragments.iter().sum()),
+                ],
             ),
         );
     }
@@ -700,25 +869,72 @@ pub fn build_evidence(
                 .collect::<Vec<_>>();
             used.sort_by_key(|(_, ms)| std::cmp::Reverse(*ms));
             let span = if day_count > 1 {
-                format!("近 {day_count} 天")
+                fill(
+                    tr!(
+                        lang,
+                        "近 {} 天",
+                        "the last {} days",
+                        "直近 {} 日間",
+                        "최근 {}일"
+                    ),
+                    &[&day_count],
+                )
             } else {
-                "今天".to_owned()
+                tr!(lang, "今天", "today", "今日", "오늘").to_owned()
+            };
+            let amount = if day_count > 1 {
+                fill(
+                    tr!(
+                        lang,
+                        "日均 {} 分钟",
+                        "{} min per day",
+                        "1日平均 {} 分",
+                        "일평균 {}분"
+                    ),
+                    &[&minutes(window_ms / day_count as i64)],
+                )
+            } else {
+                fill(
+                    tr!(
+                        lang,
+                        "共 {} 分钟",
+                        "{} min in total",
+                        "合計 {} 分",
+                        "총 {}분"
+                    ),
+                    &[&minutes(window_ms / day_count as i64)],
+                )
+            };
+            let content = if used.is_empty() {
+                tr!(lang, "无", "none", "なし", "없음").to_owned()
+            } else {
+                used.iter()
+                    .map(|(category, ms)| {
+                        fill(
+                            tr!(
+                                lang,
+                                "{0} {1} 分钟",
+                                "{0} {1} min",
+                                "{0} {1} 分",
+                                "{0} {1}분"
+                            ),
+                            &[&category_label(lang, category), &minutes(*ms)],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(list_sep)
             };
             out.push(
                 "peak_hours",
-                format!(
-                    "{span}产出类工作最集中在 {best}–{} 点（{}{} 分钟）；今天这两个小时里非产出活动：{}。",
-                    best + 2,
-                    if day_count > 1 { "日均 " } else { "共 " },
-                    minutes(window_ms / day_count as i64),
-                    if used.is_empty() {
-                        "无".to_owned()
-                    } else {
-                        used.iter()
-                            .map(|(category, ms)| format!("{category} {} 分钟", minutes(*ms)))
-                            .collect::<Vec<_>>()
-                            .join("、")
-                    }
+                fill(
+                    tr!(
+                        lang,
+                        "{0}产出类工作最集中在 {1}–{2} 点（{3}）；今天这两个小时里非产出活动：{4}。",
+                        "Productive work was most concentrated {0} between {1}:00 and {2}:00 ({3}). Non-productive activity in those two hours today: {4}.",
+                        "{0}の生産的な作業は {1}–{2} 時に最も集中しています（{3}）。今日のこの 2 時間の非生産的活動：{4}。",
+                        "{0} 생산적인 작업이 {1}–{2}시에 가장 집중되었습니다({3}). 오늘 이 두 시간 동안의 비생산 활동: {4}."
+                    ),
+                    &[&span, &best, &(best + 2), &amount, &content],
                 ),
             );
         }
@@ -732,11 +948,15 @@ pub fn build_evidence(
     {
         out.push(
             "no_break",
-            format!(
-                "{}–{} 连续活跃 {} 分钟，中间没有 ≥5 分钟的休息。",
-                hhmm(start),
-                hhmm(end),
-                minutes(end - start)
+            fill(
+                tr!(
+                    lang,
+                    "{0}–{1} 连续活跃 {2} 分钟，中间没有 ≥5 分钟的休息。",
+                    "{0}–{1} continuously active for {2} min with no break of 5 min or more.",
+                    "{0}–{1} の間、5 分以上の休憩を挟まず {2} 分連続で活動しました。",
+                    "{0}–{1} 동안 5분 이상의 휴식 없이 {2}분 연속 활동했습니다."
+                ),
+                &[&hhmm(start), &hhmm(end), &minutes(end - start)],
             ),
         );
     }
@@ -760,10 +980,20 @@ pub fn build_evidence(
             .count();
         out.push(
             "distraction",
-            format!(
-                "娱乐与资讯共 {} 分钟，进入 {} 次；其中 {work_hours} 次在 9–18 点，{after_focus} 次紧接在一段产出之后。",
-                metrics.distraction_min,
-                distractions.len()
+            fill(
+                tr!(
+                    lang,
+                    "娱乐与资讯共 {0} 分钟，进入 {1} 次；其中 {2} 次在 9–18 点，{3} 次紧接在一段产出之后。",
+                    "Leisure and news took {0} min across {1} visits; {2} between 9:00 and 18:00, {3} right after a productive run.",
+                    "娯楽・ニュースは合計 {0} 分で {1} 回。うち {2} 回は 9〜18 時、{3} 回は作業ブロックの直後でした。",
+                    "엔터테인먼트·뉴스는 총 {0}분, {1}회였습니다. 그중 {2}회는 9~18시, {3}회는 작업 구간 직후였습니다."
+                ),
+                &[
+                    &metrics.distraction_min,
+                    &distractions.len(),
+                    &work_hours,
+                    &after_focus,
+                ],
             ),
         );
     }
@@ -779,14 +1009,34 @@ pub fn build_evidence(
         late.sort_by_key(|(_, ms)| std::cmp::Reverse(*ms));
         out.push(
             "late_night",
-            format!(
-                "23 点后仍活跃 {} 分钟，主要是：{}。",
-                metrics.late_min,
-                late.iter()
-                    .take(3)
-                    .map(|(category, ms)| format!("{category} {} 分钟", minutes(*ms)))
-                    .collect::<Vec<_>>()
-                    .join("、")
+            fill(
+                tr!(
+                    lang,
+                    "23 点后仍活跃 {0} 分钟，主要是：{1}。",
+                    "Still active {0} min after 23:00, mainly: {1}.",
+                    "23 時以降も {0} 分活動しており、主な内容：{1}。",
+                    "23시 이후에도 {0}분 활동했으며, 주로: {1}."
+                ),
+                &[
+                    &metrics.late_min,
+                    &late
+                        .iter()
+                        .take(3)
+                        .map(|(category, ms)| {
+                            fill(
+                                tr!(
+                                    lang,
+                                    "{0} {1} 分钟",
+                                    "{0} {1} min",
+                                    "{0} {1} 分",
+                                    "{0} {1}분"
+                                ),
+                                &[&category_label(lang, category), &minutes(*ms)],
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(list_sep),
+                ],
             ),
         );
     }
@@ -815,13 +1065,22 @@ pub fn build_evidence(
                 .collect::<Vec<_>>();
             if seen.len() >= 2 && key.chars().count() >= 3 {
                 let average = (seen.iter().copied().sum::<i64>() + ms) / (seen.len() as i64 + 1);
-                recurring.push(format!(
-                    "{app}「{}」近 {} 天中 {} 天出现，日均 {} 分钟（今天 {} 分钟）",
-                    ai_title("", title),
-                    history.len() + 1,
-                    seen.len() + 1,
-                    minutes(average),
-                    minutes(*ms)
+                recurring.push(fill(
+                    tr!(
+                        lang,
+                        "{0}「{1}」近 {2} 天中 {3} 天出现，日均 {4} 分钟（今天 {5} 分钟）",
+                        "{0} “{1}” appeared on {3} of the last {2} days, {4} min per day on average ({5} min today)",
+                        "{0}「{1}」は直近 {2} 日中 {3} 日出現、1日平均 {4} 分（今日 {5} 分）",
+                        "{0} “{1}”은 최근 {2}일 중 {3}일 등장, 일평균 {4}분(오늘 {5}분)"
+                    ),
+                    &[
+                        app,
+                        &display_title(lang, &ai_title("", title)),
+                        &(history.len() + 1),
+                        &(seen.len() + 1),
+                        &minutes(average),
+                        &minutes(*ms),
+                    ],
                 ));
             }
         }
@@ -829,7 +1088,16 @@ pub fn build_evidence(
             recurring.truncate(4);
             out.push(
                 "recurring",
-                format!("反复出现的工作：{}。", recurring.join("；")),
+                fill(
+                    tr!(
+                        lang,
+                        "反复出现的工作：{}。",
+                        "Recurring work: {}.",
+                        "繰り返し現れる作業：{}。",
+                        "반복되는 작업: {}."
+                    ),
+                    &[&recurring.join(tight_sep)],
+                ),
             );
         }
     }
@@ -852,24 +1120,50 @@ pub fn build_evidence(
             else {
                 continue;
             };
-            let floor = if metric.unit == "分钟" { 10.0 } else { 3.0 };
+            let floor = if metric.key.ends_with("_min") {
+                10.0
+            } else {
+                3.0
+            };
             if (today - base).abs() < floor {
                 continue;
             }
             if let Some(change) = percent_change(today, base).filter(|change| change.abs() >= 25.0)
             {
-                changes.push(format!(
-                    "{} {today} {}（近 {} 天均值 {base}，{}{}%）",
-                    metric.label,
-                    metric.unit,
-                    baseline_days.len(),
-                    if change > 0.0 { "+" } else { "" },
-                    change.round()
+                changes.push(fill(
+                    tr!(
+                        lang,
+                        "{0} {1} {2}（近 {3} 天均值 {4}，{5}{6}%）",
+                        "{0} {1} {2} ({3}-day average {4}, {5}{6}%)",
+                        "{0} {1} {2}（直近 {3} 日平均 {4}、{5}{6}%）",
+                        "{0} {1} {2}(최근 {3}일 평균 {4}, {5}{6}%)"
+                    ),
+                    &[
+                        &metric.label(lang),
+                        &today,
+                        &metric.unit(lang),
+                        &baseline_days.len(),
+                        &base,
+                        &(if change > 0.0 { "+" } else { "" }),
+                        &change.round(),
+                    ],
                 ));
             }
         }
         if !changes.is_empty() {
-            out.push("trend", format!("与近期相比：{}。", changes.join("；")));
+            out.push(
+                "trend",
+                fill(
+                    tr!(
+                        lang,
+                        "与近期相比：{}。",
+                        "Compared with recent days: {}.",
+                        "最近と比べて：{}。",
+                        "최근과 비교하면: {}."
+                    ),
+                    &[&changes.join(tight_sep)],
+                ),
+            );
         }
     }
 
@@ -970,7 +1264,7 @@ mod tests {
         events.push(Event::at(ts, "lock", serde_json::json!({})));
         let stats = derive_events(&events, DeriveOptions::default(), None);
         let metrics = day_metrics(&stats);
-        let evidence = build_evidence(&stats, &metrics, &[]);
+        let evidence = build_evidence(&stats, &metrics, &[], Lang::Zh);
         let all = evidence
             .iter()
             .map(|item| item.text.clone())
@@ -993,6 +1287,20 @@ mod tests {
         assert_eq!(
             extract_numbers("切换 46 次，12.5 分钟，3."),
             vec!["46", "12.5", "3"]
+        );
+    }
+
+    #[test]
+    fn metric_labels_and_units_are_translated() {
+        let def = metric_def("deep_work_min").unwrap();
+        assert_eq!(def.label(Lang::Zh), "深度工作时长");
+        assert_eq!(def.label(Lang::En), "Deep work time");
+        assert_eq!(def.unit(Lang::Ja), "分");
+        assert_eq!(metric_def("late_min").unwrap().unit(Lang::Ko), "분");
+        assert!(
+            METRICS
+                .iter()
+                .all(|metric| !metric.label(Lang::En).is_empty())
         );
     }
 }

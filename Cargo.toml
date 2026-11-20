@@ -1,6 +1,6 @@
 [package]
 name = "tracebit"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Windows 本地行为记录与 AI 效率建议"
 license = "MIT"
@@ -36,6 +36,7 @@ tauri-winrt-notification = "0.8"
 winreg = { version = "0.56", features = ["transactions"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Cryptography",

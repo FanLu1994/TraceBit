@@ -1,10 +1,35 @@
 //! Redaction applied to every piece of text that leaves the machine.
 
-use crate::{categories::is_communication, recorder::SENSITIVE_TITLE};
+use crate::{categories::is_communication, i18n::Lang, recorder::SENSITIVE_TITLE, tr};
 use regex::Regex;
 use std::sync::LazyLock;
 
 pub const CHAT_TITLE: &str = "[聊天窗口]";
+
+/// Display form of the canonical stored placeholders: `[敏感窗口]` and
+/// `[聊天窗口]` stay Chinese everywhere they are persisted or sent to a model,
+/// and only the UI swaps them for the current language.
+pub fn display_title(lang: Lang, title: &str) -> &str {
+    if title == SENSITIVE_TITLE {
+        return tr!(
+            lang,
+            SENSITIVE_TITLE,
+            "[Sensitive window]",
+            "[機密ウィンドウ]",
+            "[민감한 창]"
+        );
+    }
+    if title == CHAT_TITLE {
+        return tr!(
+            lang,
+            CHAT_TITLE,
+            "[Chat window]",
+            "[チャットウィンドウ]",
+            "[채팅 창]"
+        );
+    }
+    title
+}
 
 /// Removes common personal data and truncates to `max` characters.
 pub fn redact_with_limit(value: &str, max: usize) -> String {
@@ -158,5 +183,17 @@ mod tests {
     fn chat_titles_are_hidden() {
         assert_eq!(ai_title("即时通讯", "张三"), CHAT_TITLE);
         assert_eq!(ai_title("开发", "main.rs - TraceBit"), "main.rs - TraceBit");
+    }
+
+    #[test]
+    fn stored_placeholders_display_in_the_ui_language() {
+        assert_eq!(display_title(Lang::Zh, CHAT_TITLE), CHAT_TITLE);
+        assert_eq!(display_title(Lang::En, CHAT_TITLE), "[Chat window]");
+        assert_eq!(display_title(Lang::Ja, SENSITIVE_TITLE), "[機密ウィンドウ]");
+        assert_eq!(display_title(Lang::Ko, SENSITIVE_TITLE), "[민감한 창]");
+        assert_eq!(
+            display_title(Lang::Ko, "main.rs - TraceBit"),
+            "main.rs - TraceBit"
+        );
     }
 }

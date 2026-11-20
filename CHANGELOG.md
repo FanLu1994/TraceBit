@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-20
+
+### 新增
+
+- 界面支持简体中文、English、日本語、한국어：首次启动跟随 Windows 显示语言，可在「设置 → 语言与界面」切换，保存后立即生效
+- AI 建议、报告、每日推送、托盘菜单、错误提示和安装包界面都按所选语言显示
+- README 提供 English、日本語、한국어 版本
+
+### 变更
+
+- AI 输出契约中的升级类型和难度改为语言无关的键（`tool` / `low` 等），旧报告仍可正常显示
+- 安装包提供四种语言，卸载快捷方式随安装时选择的语言生成
+
 ## [0.6.0] - 2026-11-20
 
 ### 新增
@@ -76,7 +89,8 @@
 - 沿用 `%APPDATA%\TraceBit` 数据格式和 camelCase `settings.json` 契约
 - NSIS 安装包替换 electron-builder，体积从约 84 MB 降到约 4.4 MB
 
-[Unreleased]: https://github.com/FanLu1994/TraceBit/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/FanLu1994/TraceBit/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/FanLu1994/TraceBit/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/FanLu1994/TraceBit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/FanLu1994/TraceBit/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/FanLu1994/TraceBit/compare/v0.4.0...v0.4.1

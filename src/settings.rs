@@ -182,6 +182,8 @@ impl AiSettings {
 pub struct AppSettings {
     pub autostart: bool,
     pub close_to_tray: bool,
+    /// `zh` / `en` / `ja` / `ko`; empty follows the Windows display language.
+    pub language: String,
 }
 
 impl Default for AppSettings {
@@ -189,7 +191,20 @@ impl Default for AppSettings {
         Self {
             autostart: false,
             close_to_tray: true,
+            language: String::new(),
         }
+    }
+}
+
+impl AppSettings {
+    pub fn lang(&self) -> crate::i18n::Lang {
+        crate::i18n::Lang::resolve(&self.language)
+    }
+}
+
+impl SettingsData {
+    pub fn lang(&self) -> crate::i18n::Lang {
+        self.app.lang()
     }
 }
 
@@ -356,6 +371,27 @@ mod tests {
 
         let loaded = Settings::load(temp.path()).get();
         assert_eq!(loaded, next);
+    }
+
+    #[test]
+    fn language_round_trips_and_old_files_follow_the_system() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(temp.path());
+        assert_eq!(settings.get().app.language, "");
+        settings.patch(&json!({"app": {"language": "ja"}})).unwrap();
+        assert_eq!(
+            Settings::load(temp.path()).get().lang(),
+            crate::i18n::Lang::Ja
+        );
+
+        fs::write(
+            temp.path().join("settings.json"),
+            r#"{"recording":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(temp.path()).get();
+        assert_eq!(loaded.app.language, "");
+        assert_eq!(loaded.lang(), crate::i18n::Lang::resolve(""));
     }
 
     #[test]

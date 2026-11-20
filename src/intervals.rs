@@ -1,9 +1,11 @@
 use crate::{
+    i18n::{Lang, fill},
     llm::{self, ChatOptions},
     recorder::SENSITIVE_TITLE,
     redact::{ai_title, redact_text},
     settings::{AiSettings, Endpoint, Settings},
     store::{DayStore, Snapshot, hhmm, local_date_key, now_ms, validate_date_key},
+    tr,
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -20,15 +22,30 @@ use std::{
 
 const MAX_SCREENSHOTS: usize = 6;
 const MAX_IMAGE_EDGE: u32 = 1024;
-const SUMMARY_SYSTEM_PROMPT: &str = r#"你是屏幕活动摘要助手。根据一段时间内按时间顺序给出的屏幕截图（每张附带当时的前台应用和窗口标题），概括用户实际在做什么。
+/// Summary prompt body, in Chinese; the output language is appended per call so
+/// stored summaries are written in the interface language.
+const SUMMARY_PROMPT_BODY: &str = r#"你是屏幕活动摘要助手。根据一段时间内按时间顺序给出的屏幕截图（每张附带当时的前台应用和窗口标题），概括用户实际在做什么。
 
 规则：
-- 使用简体中文，输出 2-4 句、约 80-180 字的纯文本，不要标题或 Markdown。
 - 说清楚任务本身（例如“在调试某个模块的登录接口”“在整理季度报表”），而不只是应用名。
 - 如果能看出卡点、等待、重复操作或频繁中断，简要指出，这对后续的效率建议最有价值。
 - 只描述画面中能确认的事实；看不清的不要猜，可以说“部分画面无法确认”。
 - 不要复述密码、密钥、银行卡号、私人聊天原文、人名等敏感内容；只概括活动类型。
 - 不评价效率，不提供建议。"#;
+
+fn summary_system_prompt(lang: Lang) -> String {
+    let directive = fill(
+        tr!(
+            lang,
+            "使用目标语言（{}）输出 2–4 句、约 80–180 字的纯文本，不要标题或 Markdown。",
+            "Write 2–4 plain-text sentences of about 80–180 characters in the target language ({}). No headings or Markdown.",
+            "対象言語（{}）で 2〜4 文、80〜180 文字程度のプレーンテキストで出力してください。見出しや Markdown は使わないでください。",
+            "대상 언어({})로 2~4문장, 약 80~180자 분량의 일반 텍스트로 작성하세요. 제목이나 Markdown은 사용하지 마세요."
+        ),
+        &[&lang.name()],
+    );
+    format!("{SUMMARY_PROMPT_BODY}\n- {directive}")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -74,17 +91,23 @@ pub fn read_summaries(directory: &Path, date_key: &str) -> Vec<IntervalSummary> 
 
 /// Screenshot analysis uses the same endpoint and model as the advice; the
 /// configured model must accept image input (a multimodal model).
-pub fn vision_endpoint(ai: &AiSettings) -> Result<Endpoint> {
+pub fn vision_endpoint(ai: &AiSettings, lang: Lang) -> Result<Endpoint> {
     let endpoint = ai.text_endpoint();
     if !endpoint.configured() {
-        bail!("请先在设置中配置支持图片输入的多模态模型，例如 qwen2.5vl、gpt-4o-mini");
+        bail!(tr!(
+            lang,
+            "请先在设置中配置支持图片输入的多模态模型，例如 qwen2.5vl、gpt-4o-mini",
+            "Configure a multimodal model that accepts image input in Settings first, such as qwen2.5vl or gpt-4o-mini.",
+            "設定で画像入力に対応したマルチモーダルモデル（例：qwen2.5vl、gpt-4o-mini）を構成してください。",
+            "설정에서 이미지 입력을 지원하는 멀티모달 모델(예: qwen2.5vl, gpt-4o-mini)을 먼저 구성하세요."
+        ));
     }
     Ok(endpoint)
 }
 
 /// Sends a tiny generated image to verify the vision endpoint reads images.
-pub fn test_vision(ai: &AiSettings) -> Result<String> {
-    let endpoint = vision_endpoint(ai)?;
+pub fn test_vision(ai: &AiSettings, lang: Lang) -> Result<String> {
+    let endpoint = vision_endpoint(ai, lang)?;
     let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         64,
         64,
@@ -101,8 +124,17 @@ pub fn test_vision(ai: &AiSettings) -> Result<String> {
             timeout_ms: 60_000,
             ..Default::default()
         },
+        lang,
     )
-    .context("视觉模型测试失败（模型可能不支持图片输入）")?;
+    .with_context(|| {
+        tr!(
+            lang,
+            "视觉模型测试失败（模型可能不支持图片输入）",
+            "The vision model test failed (the model may not accept image input).",
+            "ビジョンモデルのテストに失敗しました（モデルが画像入力に対応していない可能性があります）。",
+            "비전 모델 테스트에 실패했습니다(모델이 이미지 입력을 지원하지 않을 수 있습니다)."
+        )
+    })?;
     Ok(output.model)
 }
 
@@ -194,27 +226,48 @@ impl IntervalAnalyzer {
         end: i64,
         snapshots: Vec<Snapshot>,
     ) -> Result<IntervalSummary> {
+        let config = self.settings.get();
+        let lang = config.lang();
         if snapshots.is_empty() {
-            bail!("该时段没有可分析的截图");
+            bail!(tr!(
+                lang,
+                "该时段没有可分析的截图",
+                "There are no analyzable screenshots in this interval.",
+                "この時間帯に分析できるスクリーンショットがありません。",
+                "이 시간대에 분석할 스크린샷이 없습니다."
+            ));
         }
-        let ai = self.settings.get().ai;
-        let endpoint = vision_endpoint(&ai)?;
+        let ai = config.ai;
+        let endpoint = vision_endpoint(&ai, lang)?;
         let previous = self
             .list(&local_date_key(start))
             .into_iter()
             .rev()
             .find(|summary| summary.end <= start && start - summary.end <= 4 * 3_600_000);
-        let mut prompt = format!(
-            "请总结 {} 到 {} 这一时段用户在做什么。",
-            hhmm(start),
-            hhmm(end)
+        let mut prompt = fill(
+            tr!(
+                lang,
+                "请总结 {0} 到 {1} 这一时段用户在做什么。",
+                "Summarize what the user was doing between {0} and {1}.",
+                "{0} から {1} までの時間帯にユーザーが何をしていたかを要約してください。",
+                "{0}부터 {1}까지 이 시간대에 사용자가 무엇을 했는지 요약하세요."
+            ),
+            &[&hhmm(start), &hhmm(end)],
         );
         if let Some(previous) = &previous {
-            prompt.push_str(&format!(
-                "上一时段（{}–{}）的摘要供衔接参考：{}",
-                hhmm(previous.start),
-                hhmm(previous.end),
-                redact_text(&previous.summary)
+            prompt.push_str(&fill(
+                tr!(
+                    lang,
+                    "上一时段（{0}–{1}）的摘要供衔接参考：{2}",
+                    "The previous interval summary ({0}–{1}), for continuity: {2}",
+                    "前の時間帯（{0}–{1}）の要約（参考）：{2}",
+                    "이전 구간({0}–{1}) 요약(참고): {2}"
+                ),
+                &[
+                    &hhmm(previous.start),
+                    &hhmm(previous.end),
+                    &redact_text(&previous.summary),
+                ],
             ));
         }
         let mut content = vec![json!({"type":"text", "text":prompt})];
@@ -226,7 +279,7 @@ impl IntervalAnalyzer {
             let Some(path) = self.store.snapshot_path(&shot.file) else {
                 continue;
             };
-            match snapshot_data_url(&path) {
+            match snapshot_data_url(&path, lang) {
                 Ok(url) => {
                     let app = shot.app.clone().unwrap_or_default();
                     let category = crate::categories::categorize("", &app, "");
@@ -235,12 +288,15 @@ impl IntervalAnalyzer {
                         .as_deref()
                         .map(|title| ai_title(category, title))
                         .unwrap_or_default();
-                    content.push(json!({"type":"text", "text": format!(
-                        "第 {} 张，{}，前台：{} {}",
-                        index + 1,
-                        hhmm(shot.ts),
-                        redact_text(&app),
-                        title
+                    content.push(json!({"type":"text", "text": fill(
+                        tr!(
+                            lang,
+                            "第 {0} 张，{1}，前台：{2} {3}",
+                            "Screenshot {0}, {1}, foreground: {2} {3}",
+                            "画像 {0}、{1}、前面：{2} {3}",
+                            "스크린샷 {0}, {1}, 전경: {2} {3}"
+                        ),
+                        &[&(index + 1), &hhmm(shot.ts), &redact_text(&app), &title]
                     )}));
                     content.push(json!({"type":"image_url", "image_url":{"url":url}}));
                     files.push(shot.file.clone());
@@ -249,7 +305,13 @@ impl IntervalAnalyzer {
             }
         }
         if files.is_empty() {
-            bail!("该时段的截图均无法读取");
+            bail!(tr!(
+                lang,
+                "该时段的截图均无法读取",
+                "None of the screenshots in this interval could be read.",
+                "この時間帯のスクリーンショットはすべて読み込めませんでした。",
+                "이 시간대의 스크린샷을 모두 읽을 수 없습니다."
+            ));
         }
         let text_parts = content
             .iter()
@@ -266,7 +328,7 @@ impl IntervalAnalyzer {
         let output = llm::chat(
             &endpoint,
             json!([
-                {"role":"system", "content":SUMMARY_SYSTEM_PROMPT},
+                {"role":"system", "content":summary_system_prompt(lang)},
                 {"role":"user", "content":Value::Array(content)}
             ]),
             ChatOptions {
@@ -274,6 +336,7 @@ impl IntervalAnalyzer {
                 timeout_ms: 120_000,
                 ..Default::default()
             },
+            lang,
         )?;
         let summary = IntervalSummary {
             start,
@@ -294,15 +357,32 @@ impl IntervalAnalyzer {
     }
 
     fn snapshots_between(&self, start: i64, end: i64) -> Result<Vec<Snapshot>> {
+        let lang = self.settings.get().lang();
         let start_date = Local
             .timestamp_millis_opt(start)
             .single()
-            .context("分析开始时间无效")?
+            .with_context(|| {
+                tr!(
+                    lang,
+                    "分析开始时间无效",
+                    "The analysis start time is invalid.",
+                    "分析の開始時刻が無効です。",
+                    "분석 시작 시간이 유효하지 않습니다."
+                )
+            })?
             .date_naive();
         let end_date = Local
             .timestamp_millis_opt(end)
             .single()
-            .context("分析结束时间无效")?
+            .with_context(|| {
+                tr!(
+                    lang,
+                    "分析结束时间无效",
+                    "The analysis end time is invalid.",
+                    "分析の終了時刻が無効です。",
+                    "분석 종료 시간이 유효하지 않습니다."
+                )
+            })?
             .date_naive();
         let mut snapshots = Vec::new();
         let mut date = start_date;
@@ -369,8 +449,19 @@ fn select_snapshots(snapshots: &[Snapshot]) -> Vec<Snapshot> {
         .collect()
 }
 
-fn snapshot_data_url(path: &Path) -> Result<String> {
-    let image = image::open(path).with_context(|| format!("无法解码 {}", path.display()))?;
+fn snapshot_data_url(path: &Path, lang: Lang) -> Result<String> {
+    let image = image::open(path).with_context(|| {
+        fill(
+            tr!(
+                lang,
+                "无法解码 {}",
+                "Cannot decode {}",
+                "{} をデコードできません",
+                "{}을(를) 디코딩할 수 없습니다"
+            ),
+            &[&path.display()],
+        )
+    })?;
     let (width, height) = image.dimensions();
     let longest_edge = width.max(height);
     let image = if longest_edge > MAX_IMAGE_EDGE {
@@ -428,7 +519,7 @@ mod tests {
         let image =
             DynamicImage::ImageRgba8(ImageBuffer::from_pixel(1600, 800, Rgba([20, 40, 60, 255])));
         image.save(&path).unwrap();
-        let url = snapshot_data_url(&path).unwrap();
+        let url = snapshot_data_url(&path, Lang::Zh).unwrap();
         let encoded = url.strip_prefix("data:image/jpeg;base64,").unwrap();
         let bytes = STANDARD.decode(encoded).unwrap();
         let resized = image::load_from_memory(&bytes).unwrap();
@@ -452,10 +543,10 @@ mod tests {
     #[test]
     fn screenshot_analysis_uses_the_main_multimodal_model() {
         let mut ai = AiSettings::default();
-        assert!(vision_endpoint(&ai).is_err());
+        assert!(vision_endpoint(&ai, Lang::Zh).is_err());
         ai.base_url = "https://api.openai.com/v1".to_owned();
         ai.model = "gpt-4o-mini".to_owned();
-        let endpoint = vision_endpoint(&ai).unwrap();
+        let endpoint = vision_endpoint(&ai, Lang::Zh).unwrap();
         assert_eq!(endpoint.model, "gpt-4o-mini");
         assert_eq!(endpoint.base_url, "https://api.openai.com/v1");
     }

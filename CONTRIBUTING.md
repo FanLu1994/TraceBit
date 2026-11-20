@@ -45,7 +45,7 @@ feat: add a recent activity statistics page
 fix: keep cross-midnight activity in the day timeline
 docs: document the installer build
 refactor: split the settings form out of app.rs
-chore: bump version to 0.6.0
+chore: bump version to 0.7.0
 ```
 
 一个提交只做一件事；格式化、重命名等无关改动单独提交。
@@ -67,13 +67,30 @@ chore: bump version to 0.6.0
 4. 提交 `chore: bump version to X.Y.Z`，打标签并推送：
 
    ```bash
-   git tag -a v0.6.0 -m "TraceBit 0.6.0"
+   git tag -a v0.7.0 -m "TraceBit 0.7.0"
    git push origin main --follow-tags
    ```
 
 5. 推送 tag 后，`.github/workflows/release.yml` 会校验 tag 与 `Cargo.toml` 版本一致，构建 `tracebit.exe`、生成 NSIS 安装包并上传到对应 Release。GitHub 上需要先有同名 tag；Release 不存在时 workflow 会自动创建。
 
 安装包命名固定为 `dist\TraceBit Setup X.Y.Z.exe`，Release 附件由 workflow 上传，不需要手动传。
+
+## 多语言文案
+
+界面文案写在调用处：`tr!(lang, "中文", "English", "日本語", "한국어")`，四个都必填；带占位符时用
+`crate::i18n::fill`，各语言的 `{}` / `{0}` 数量必须一致。`Lang` 取自 `SettingsData::lang()`，
+保存语言后立即生效，报告内容保留生成时的语言。
+
+写入磁盘或发给模型的值保持中文，只在显示层转换：
+
+| 内容 | 显示层函数 |
+| --- | --- |
+| 分类 id（开发、浏览器…） | `categories::label(lang, id)` |
+| `[敏感窗口]`、`[聊天窗口]` | `redact::display_title(lang, value)` |
+| 工作画像角色（编辑器、终端…） | `recommendations::role_label(lang, role)` |
+| AI 输出契约（`tool`、`low` 等） | `analyzer::kind_label` / `level_label` |
+
+新增或修改用户可见文案时，同步更新 `README.md`、`README.en.md`、`README.ja.md`、`README.ko.md` 四份。
 
 ## 目录速查
 

@@ -9,6 +9,7 @@
 //! on its own, and tools the person marked as adopted are re-measured.
 
 use crate::{
+    i18n::{Lang, fill},
     insights::{
         self, DayMetrics, Evidence, History, METRICS, build_evidence, day_metrics, known_numbers,
         metric_def,
@@ -20,6 +21,7 @@ use crate::{
     redact::redact_with_limit,
     settings::Settings,
     store::{DayStats, DayStore, DeriveOptions, hhmm, local_datetime, now_ms, validate_date_key},
+    tr,
     web_search::enrich_recommendations,
 };
 use anyhow::{Result, bail};
@@ -41,8 +43,18 @@ pub const PROMPT_VERSION: &str = "advice-v3";
 const HISTORY_DAYS: i64 = 7;
 /// How many tool opportunities a report keeps.
 const MAX_OPPORTUNITIES: usize = 4;
-const UPGRADE_TYPES: [&str; 5] = ["工具", "替代", "自动化", "配置", "集成"];
-const LEVELS: [&str; 3] = ["低", "中", "高"];
+const UPGRADE_TYPES: [&str; 5] = ["tool", "alternative", "automation", "config", "integration"];
+const LEVELS: [&str; 3] = ["low", "medium", "high"];
+/// Chinese enum values written by reports generated before the contract moved
+/// to language-neutral keys. Accepted on read and mapped to the new keys.
+const LEGACY_KINDS: [(&str, &str); 5] = [
+    ("工具", "tool"),
+    ("替代", "alternative"),
+    ("自动化", "automation"),
+    ("配置", "config"),
+    ("集成", "integration"),
+];
+const LEGACY_LEVELS: [(&str, &str); 3] = [("低", "low"), ("中", "medium"), ("高", "high")];
 
 /// A statement about how this person works, taken from the evidence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -99,15 +111,27 @@ pub struct AdoptionReview {
 }
 
 impl AdoptionReview {
-    pub fn text(&self) -> String {
+    pub fn text(&self, lang: Lang) -> String {
         match &self.after {
-            Some(after) => format!(
-                "你在 {} 记录了「{}」。当时：{} 现在：{}",
-                self.date_key, self.resource, self.before, after
+            Some(after) => fill(
+                tr!(
+                    lang,
+                    "你在 {} 记录了「{}」。当时：{} 现在：{}",
+                    "On {} you recorded “{}”. Then: {} Now: {}",
+                    "{} に「{}」を記録しました。当時：{} 現在：{}",
+                    "{}에 “{}”을(를) 기록했습니다. 당시: {} 지금: {}"
+                ),
+                &[&self.date_key, &self.resource, &self.before, after],
             ),
-            None => format!(
-                "你在 {} 记录了「{}」。当时：{} 今天这类来回已经不再是候选，说明它要么已经解决，要么当天没有发生。",
-                self.date_key, self.resource, self.before
+            None => fill(
+                tr!(
+                    lang,
+                    "你在 {} 记录了「{}」。当时：{} 今天这类来回已经不再是候选，说明它要么已经解决，要么当天没有发生。",
+                    "On {} you recorded “{}”. Then: {} Today this kind of back-and-forth is no longer a candidate, so it was either resolved or did not happen.",
+                    "{} に「{}」を記録しました。当時：{} 今日はこの種の往復が候補に上がっていません。解決済みか、その日は発生しなかったと考えられます。",
+                    "{}에 “{}”을(를) 기록했습니다. 당시: {} 오늘은 이런 왕복이 더 이상 후보가 아니며, 이미 해결되었거나 그날 발생하지 않았다는 뜻입니다."
+                ),
+                &[&self.date_key, &self.resource, &self.before],
             ),
         }
     }
@@ -190,7 +214,9 @@ pub struct AdviceContext {
     pub user_prompt: String,
 }
 
-pub const SYSTEM_PROMPT: &str = r#"你是一位工具升级顾问。你会拿到某人真实工作方式的长期画像、今天的电脑使用证据（由本地软件计算并脱敏）、截图时段摘要、可用工具候选，以及他之前对工具的决定。
+/// Prompt body, in Chinese. The one line that depends on the interface
+/// language is appended by [`system_prompt`] so the JSON contract stays fixed.
+const PROMPT_BODY: &str = r#"你是一位工具升级顾问。你会拿到某人真实工作方式的长期画像、今天的电脑使用证据（由本地软件计算并脱敏）、截图时段摘要、可用工具候选，以及他之前对工具的决定。
 
 你的任务不是纠正他的习惯，而是让他已经在做的事更省力。
 
@@ -206,19 +232,32 @@ pub const SYSTEM_PROMPT: &str = r#"你是一位工具升级顾问。你会拿到
 - 优先开源、可本地运行、无账号锁定的选择；能替代他现在用的付费或受限工具时，在 alternative 写明替代对象。
 - 必须引用证据编号（E 开头是今天，P 开头是长期画像，S 开头是截图摘要）。不得编造证据里没有的数字、应用或时间；payoff 里出现的数字必须来自证据。
 - tools 只能填工具候选的编号；候选里没有合适的就填空数组，不要自己写工具名或链接。
-- 已采纳的工具不要当作新发现重复推荐；已标记不需要的工具不要再次推荐。
-- 简体中文。只输出一个 JSON 对象，不要 Markdown，不要代码块。"#;
+- 已采纳的工具不要当作新发现重复推荐；已标记不需要的工具不要再次推荐。"#;
 
-fn output_contract(metrics: &DayMetrics) -> String {
+fn system_prompt(lang: Lang) -> String {
+    let directive = fill(
+        tr!(
+            lang,
+            "所有面向用户的文字都用目标语言（{}）撰写。只输出一个 JSON 对象，不要 Markdown，不要代码块。",
+            "Write every user-facing string in the target language ({}). Only output one JSON object, with no Markdown and no code blocks.",
+            "ユーザー向けの文字列はすべて対象言語（{}）で書いてください。JSON オブジェクトを 1 つだけ出力し、Markdown もコードブロックも使わないでください。",
+            "사용자에게 보이는 문자열은 모두 대상 언어({})로 작성하세요. JSON 객체 하나만 출력하고 Markdown과 코드 블록은 사용하지 마세요."
+        ),
+        &[&lang.name()],
+    );
+    format!("{PROMPT_BODY}\n- {directive}")
+}
+
+fn output_contract(metrics: &DayMetrics, lang: Lang) -> String {
     let keys = METRICS
         .iter()
         .map(|metric| {
             format!(
                 "{}（{}，今天 {} {}）",
                 metric.key,
-                metric.label,
+                metric.label(lang),
                 metrics.get(metric.key).unwrap_or(0.0),
-                metric.unit
+                metric.unit(lang)
             )
         })
         .collect::<Vec<_>>()
@@ -227,10 +266,10 @@ fn output_contract(metrics: &DayMetrics) -> String {
         r#"输出 JSON 结构（字段名必须一致）：
 {{
   "headline": "一句话描述他实际怎么工作（陈述句，不是要求），不超过 40 字",
-  "reading": [{{"observation": "关于他工作方式的观察", "evidence": ["P1", "E2"], "confidence": "高|中|低"}}],
+  "reading": [{{"observation": "关于他工作方式的观察", "evidence": ["P1", "E2"], "confidence": "low|medium|high"}}],
   "upgrades": [{{
     "title": "具体工具或做法，动词开头，不超过 20 字",
-    "type": "工具|替代|自动化|配置|集成",
+    "type": "tool|alternative|automation|config|integration",
     "evidence": ["E1"],
     "habit": "它接上你现在做的哪件事",
     "problem": "这件事现在的时间和步骤成本（引用证据里的数字）",
@@ -238,24 +277,33 @@ fn output_contract(metrics: &DayMetrics) -> String {
     "payoff": "省下的时间或步骤，及依据",
     "risk": "风险与注意",
     "alternative": "它替代的现有工具名；没有就空字符串",
-    "effort": "低|中|高",
-    "confidence": "高|中|低",
+    "effort": "low|medium|high",
+    "confidence": "low|medium|high",
     "tools": ["工具候选编号"]
   }}],
   "watch": [{{"metric": "指标键名", "reason": "为什么值得下次观察"}}],
   "followup": "对上次采纳情况的说明；没有则空字符串"
 }}
-reading 2–4 条；upgrades 2–4 条，按优先级排序；actions 1–4 步；watch 1–2 条，metric 只能取以下键之一：{keys}"#
+reading 2–4 条；upgrades 2–4 条，按优先级排序；actions 1–4 步；watch 1–2 条，metric 只能取以下键之一：{keys}
+输出语言：{lang_name}；字段名与 type、effort、confidence 的取值保持上面的英文键名。"#,
+        lang_name = lang.name()
     )
 }
 
-fn week_label(date_key: &str) -> String {
+fn week_label(date_key: &str, lang: Lang) -> String {
     NaiveDate::parse_from_str(date_key, "%Y-%m-%d")
         .map(|date| {
             use chrono::Datelike;
-            ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
-                [date.weekday().num_days_from_sunday() as usize]
-                .to_owned()
+            let names = [
+                tr!(lang, "周日", "Sun", "日", "일"),
+                tr!(lang, "周一", "Mon", "月", "월"),
+                tr!(lang, "周二", "Tue", "火", "화"),
+                tr!(lang, "周三", "Wed", "水", "수"),
+                tr!(lang, "周四", "Thu", "木", "목"),
+                tr!(lang, "周五", "Fri", "金", "금"),
+                tr!(lang, "周六", "Sat", "土", "토"),
+            ];
+            names[date.weekday().num_days_from_sunday() as usize].to_owned()
         })
         .unwrap_or_default()
 }
@@ -268,6 +316,20 @@ fn fmt_number(value: f64) -> String {
     }
 }
 
+/// A date-key error reaches the UI, so it is reported in the interface
+/// language while the stored format check stays in `store`.
+fn check_date(date_key: &str, lang: Lang) -> Result<()> {
+    validate_date_key(date_key).map_err(|_| {
+        anyhow::anyhow!(tr!(
+            lang,
+            "日期格式无效",
+            "Invalid date format.",
+            "日付の形式が正しくありません。",
+            "날짜 형식이 올바르지 않습니다."
+        ))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_user_prompt(
     date_key: &str,
@@ -278,10 +340,11 @@ fn build_user_prompt(
     recommendations: &[Recommendation],
     decisions: &str,
     adoptions: &[AdoptionReview],
+    lang: Lang,
 ) -> String {
     let mut lines = vec![format!(
         "日期：{date_key}（{}）。以下内容由本地软件记录、计算并脱敏，聊天窗口只保留应用名。",
-        week_label(date_key)
+        week_label(date_key, lang)
     )];
     if !profile.is_empty() {
         lines.push(String::new());
@@ -311,7 +374,7 @@ fn build_user_prompt(
         lines.push(String::new());
         lines.push("【采纳回看】".to_owned());
         for item in adoptions {
-            lines.push(format!("- {}", item.text()));
+            lines.push(format!("- {}", item.text(lang)));
         }
     }
     lines.push(String::new());
@@ -337,16 +400,47 @@ fn build_user_prompt(
         lines.push(line);
     }
     lines.push(String::new());
-    lines.push(output_contract(metrics));
+    lines.push(output_contract(metrics, lang));
     lines.join("\n")
 }
 
-fn normalize_choice(value: &str, allowed: &[&str], fallback: &str) -> String {
+fn normalize_choice(
+    value: &str,
+    allowed: &[&str],
+    legacy: &[(&str, &str)],
+    fallback: &str,
+) -> String {
+    let value = value.trim();
+    if let Some((_, key)) = legacy.iter().find(|(label, _)| value.contains(*label)) {
+        return (*key).to_owned();
+    }
     allowed
         .iter()
         .find(|choice| value.contains(**choice))
         .unwrap_or(&fallback)
         .to_string()
+}
+
+/// Display label for an upgrade kind. Accepts the language-neutral keys and the
+/// Chinese values written by older reports.
+pub fn kind_label(lang: Lang, kind: &str) -> &'static str {
+    match kind.trim() {
+        "alternative" | "替代" => tr!(lang, "替代", "Alternative", "代替", "대체"),
+        "automation" | "自动化" => tr!(lang, "自动化", "Automation", "自動化", "자동화"),
+        "config" | "配置" => tr!(lang, "配置", "Config", "設定", "설정"),
+        "integration" | "集成" => tr!(lang, "集成", "Integration", "連携", "연동"),
+        _ => tr!(lang, "工具", "Tool", "ツール", "도구"),
+    }
+}
+
+/// Display label for an effort/confidence level. Accepts the language-neutral
+/// keys and the Chinese values written by older reports.
+pub fn level_label(lang: Lang, level: &str) -> &'static str {
+    match level.trim() {
+        "low" | "低" => tr!(lang, "低", "Low", "低", "낮음"),
+        "high" | "高" => tr!(lang, "高", "High", "高", "높음"),
+        _ => tr!(lang, "中", "Medium", "中", "보통"),
+    }
 }
 
 /// Numbers in factual claims that are not in the evidence. Small numbers (up to
@@ -363,9 +457,28 @@ fn unverified(text: &str, known: &BTreeSet<String>) -> Vec<String> {
 /// Upgrades matching it are dropped and reported, so the promise is enforced
 /// locally rather than only in the prompt.
 static BEHAVIOR_PRESSURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"戒掉|戒除|减少(?:使用|打开|查看|刷|玩)|少用|少看|不要(?:再)?(?:看|刷|玩)|定时(?:集中)?(?:回复|查看|处理)|关闭(?:消息)?通知|免打扰|早睡|多休息|番茄钟|自律|时间管理|提高专注|管理注意力",
-    )
+    Regex::new(concat!(
+        r"(?i)",
+        r"戒掉|戒除|减少(?:使用|打开|查看|刷|玩)|少用|少看|不要(?:再)?(?:看|刷|玩)",
+        r"|定时(?:集中)?(?:回复|查看|处理)|关闭(?:消息)?通知|免打扰|早睡|多休息",
+        r"|番茄钟|自律|时间管理|提高专注|管理注意力",
+        // English: only advice about the person's habits, never about steps.
+        r"|\b(?:quit|stop)\s+(?:using|opening|checking|scrolling)\b",
+        r"|\breduce\s+(?:your\s+)?(?:screen\s+time|usage|app\s+switching)\b",
+        r"|\buse\s+less\b|\bavoid\s+using\b|\b(?:do\s+not|don't)\s+use\b",
+        r"|\bturn\s+off\s+(?:the\s+)?notifications\b|\bdo\s+not\s+disturb\b",
+        r"|\bsleep\s+earlier\b|\bgo\s+to\s+bed\s+earlier\b|\btake\s+(?:more\s+)?breaks\b",
+        r"|\bpomodoro\b|\bself[- ]discipline\b|\btime\s+management\b",
+        r"|\bmanage\s+(?:your\s+)?attention\b|\bimprove\s+(?:your\s+)?focus\b",
+        // Japanese: limit to usage/time/notification objects so "手順を減らす" stays valid.
+        r"|(?:使用|利用|画面|時間|確認|通知|アプリ)[^\n]{0,8}?(?:減ら|控え)",
+        r"|やめましょう|やめてください|使わないで|見ないで|通知を(?:オフ|切)",
+        r"|早寝|早く寝|休憩を(?:増や|と)|ポモドーロ|自己管理|時間管理|集中力を(?:高め|上げ)",
+        // Korean: same rule; "단계를 줄이는" is a tool improvement, not pressure.
+        r"|(?:사용|화면|시간|확인|알림|앱)[^\n]{0,8}?(?:줄이|줄여)",
+        r"|그만\s*(?:사용|보|쓰)|사용하지\s*마|보지\s*마|알림을\s*(?:끄|꺼)",
+        r"|일찍\s*자|휴식을\s*(?:늘|취)|뽀모도로|자기\s*관리|시간\s*관리|집중력을\s*(?:높|올)",
+    ))
     .unwrap()
 });
 
@@ -380,6 +493,7 @@ pub fn validate_advice(
     tool_ids: &BTreeSet<String>,
     known: &BTreeSet<String>,
     metrics: &DayMetrics,
+    lang: Lang,
 ) -> Result<Advice> {
     let keep_ids = |ids: &mut Vec<String>| {
         let mut seen = BTreeSet::new();
@@ -393,7 +507,7 @@ pub fn validate_advice(
         keep_ids(&mut item.evidence);
         flagged.extend(unverified(&item.observation, known));
         item.observation = item.observation.trim().to_owned();
-        item.confidence = normalize_choice(&item.confidence, &LEVELS, "中");
+        item.confidence = normalize_choice(&item.confidence, &LEVELS, &LEGACY_LEVELS, "medium");
         !item.evidence.is_empty() && !item.observation.is_empty()
     });
     advice.reading.truncate(4);
@@ -403,9 +517,10 @@ pub fn validate_advice(
         keep_ids(&mut upgrade.evidence);
         upgrade.tools.retain(|tool| tool_ids.contains(tool.trim()));
         upgrade.title = upgrade.title.trim().to_owned();
-        upgrade.kind = normalize_choice(&upgrade.kind, &UPGRADE_TYPES, "工具");
-        upgrade.effort = normalize_choice(&upgrade.effort, &LEVELS, "中");
-        upgrade.confidence = normalize_choice(&upgrade.confidence, &LEVELS, "中");
+        upgrade.kind = normalize_choice(&upgrade.kind, &UPGRADE_TYPES, &LEGACY_KINDS, "tool");
+        upgrade.effort = normalize_choice(&upgrade.effort, &LEVELS, &LEGACY_LEVELS, "medium");
+        upgrade.confidence =
+            normalize_choice(&upgrade.confidence, &LEVELS, &LEGACY_LEVELS, "medium");
         upgrade.actions = upgrade
             .actions
             .iter()
@@ -426,12 +541,24 @@ pub fn validate_advice(
     advice.upgrades.truncate(4);
     if advice.upgrades.is_empty() {
         if !filtered.is_empty() {
-            bail!(
-                "AI 只给出了要求改变习惯的建议（已过滤 {} 条），请重试或换用更强的模型",
-                filtered.len()
-            );
+            bail!(fill(
+                tr!(
+                    lang,
+                    "AI 只给出了要求改变习惯的建议（已过滤 {} 条），请重试或换用更强的模型",
+                    "The AI only suggested behavior changes ({} filtered out). Try again or use a stronger model.",
+                    "AI は習慣の変更を求める提案しか出しませんでした（{} 件を除外）。再試行するか、より強力なモデルを使ってください。",
+                    "AI가 습관 변경을 요구하는 제안만 내놓았습니다({}개 제외됨). 다시 시도하거나 더 강력한 모델을 사용하세요."
+                ),
+                &[&filtered.len()]
+            ));
         }
-        bail!("AI 输出中没有引用有效证据的工具升级，请重试或换用更强的模型");
+        bail!(tr!(
+            lang,
+            "AI 输出中没有引用有效证据的工具升级，请重试或换用更强的模型",
+            "The AI output contained no tool upgrade backed by valid evidence. Try again or use a stronger model.",
+            "AI の出力に、有効な根拠を引用したツール改善がありませんでした。再試行するか、より強力なモデルを使ってください。",
+            "AI 출력에 유효한 근거를 인용한 도구 개선이 없습니다. 다시 시도하거나 더 강력한 모델을 사용하세요."
+        ));
     }
     advice.filtered = filtered;
 
@@ -453,6 +580,7 @@ pub fn validate_advice(
     Ok(advice)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_markdown(
     date_key: &str,
     advice: &Advice,
@@ -461,112 +589,287 @@ pub fn render_markdown(
     recommendations: &[Recommendation],
     search: &SearchSummary,
     adoptions: &[AdoptionReview],
+    lang: Lang,
 ) -> String {
+    let list_sep = tr!(lang, "、", ", ", "、", ", ");
     let mut lines = vec![
-        format!("# {date_key} 工具升级建议"),
+        format!(
+            "# {date_key} {}",
+            tr!(
+                lang,
+                "工具升级建议",
+                "Tool upgrade advice",
+                "ツール改善の提案",
+                "도구 개선 제안"
+            )
+        ),
         String::new(),
         format!("> {}", advice.headline.trim()),
         String::new(),
-        format!(
-            "活跃 {} 分钟 · 深度工作 {} 分钟 · 每小时切换 {} 次 · 通讯 {} 次 · 会议 {} 分钟",
-            fmt_number(metrics.active_min),
-            fmt_number(metrics.deep_work_min),
-            fmt_number(metrics.switches_per_hour),
-            fmt_number(metrics.comm_checks),
-            fmt_number(metrics.meeting_min)
+        fill(
+            tr!(
+                lang,
+                "活跃 {} 分钟 · 深度工作 {} 分钟 · 每小时切换 {} 次 · 通讯 {} 次 · 会议 {} 分钟",
+                "Active {} min · Deep work {} min · Switches {} per hour · Chat {} times · Meetings {} min",
+                "アクティブ {} 分 · 集中作業 {} 分 · 1時間あたりの切り替え {} 回 · チャット {} 回 · 会議 {} 分",
+                "활동 {}분 · 집중 작업 {}분 · 시간당 전환 {}회 · 채팅 {}회 · 회의 {}분"
+            ),
+            &[
+                &fmt_number(metrics.active_min),
+                &fmt_number(metrics.deep_work_min),
+                &fmt_number(metrics.switches_per_hour),
+                &fmt_number(metrics.comm_checks),
+                &fmt_number(metrics.meeting_min),
+            ],
         ),
     ];
 
     if !adoptions.is_empty() {
-        lines.extend([String::new(), "## 采纳回看".to_owned()]);
+        lines.extend([
+            String::new(),
+            format!(
+                "## {}",
+                tr!(
+                    lang,
+                    "采纳回看",
+                    "Adoption review",
+                    "採用後の振り返り",
+                    "채택 후 점검"
+                )
+            ),
+        ]);
         for item in adoptions {
-            lines.push(format!("- {}", item.text()));
+            lines.push(format!("- {}", item.text(lang)));
         }
         if !advice.followup.trim().is_empty() {
-            lines.push(format!("- 说明：{}", advice.followup.trim()));
+            lines.push(fill(
+                tr!(lang, "- 说明：{}", "- Note: {}", "- メモ：{}", "- 설명: {}"),
+                &[&advice.followup.trim()],
+            ));
         }
     }
 
     if !advice.reading.is_empty() {
-        lines.extend([String::new(), "## 你的工作方式".to_owned()]);
+        lines.extend([
+            String::new(),
+            format!(
+                "## {}",
+                tr!(
+                    lang,
+                    "你的工作方式",
+                    "How you work",
+                    "あなたの働き方",
+                    "업무 방식"
+                )
+            ),
+        ]);
         for item in &advice.reading {
-            lines.push(format!(
-                "- {}（依据 {}）",
-                item.observation.trim(),
-                item.evidence.join("、")
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- {}（依据 {}）",
+                    "- {} (evidence {})",
+                    "- {}（根拠 {}）",
+                    "- {} (근거 {})"
+                ),
+                &[&item.observation.trim(), &item.evidence.join(list_sep)],
             ));
         }
         if !advice.unverified_numbers.is_empty() {
-            lines.push(format!(
-                "> 注意：以上描述中的数字 {} 无法在记录中核实，请谨慎参考。",
-                advice.unverified_numbers.join("、")
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "> 注意：以上描述中的数字 {} 无法在记录中核实，请谨慎参考。",
+                    "> Note: the numbers {} above cannot be verified in the records; use them with care.",
+                    "> 注意：上記の記述にある数値 {} は記録から確認できません。参考程度にしてください。",
+                    "> 참고: 위 설명의 숫자 {}는 기록에서 확인할 수 없으니 주의해서 참고하세요."
+                ),
+                &[&advice.unverified_numbers.join(list_sep)],
             ));
         }
     }
 
-    lines.extend([String::new(), "## 工具升级机会".to_owned()]);
+    lines.extend([
+        String::new(),
+        format!(
+            "## {}",
+            tr!(
+                lang,
+                "工具升级机会",
+                "Tool opportunities",
+                "ツール改善の機会",
+                "도구 개선 기회"
+            )
+        ),
+    ]);
     for (index, upgrade) in advice.upgrades.iter().enumerate() {
         lines.push(String::new());
         lines.push(format!("### {}. {}", index + 1, upgrade.title.trim()));
-        lines.push(format!(
-            "{} · 投入{} · 把握{} · 依据 {}",
-            upgrade.kind,
-            upgrade.effort,
-            upgrade.confidence,
-            upgrade.evidence.join("、")
+        lines.push(fill(
+            tr!(
+                lang,
+                "{} · 投入{} · 把握{} · 依据 {}",
+                "{} · Effort: {} · Confidence: {} · Evidence: {}",
+                "{}・工数{}・確度{}・根拠 {}",
+                "{} · 투입 {} · 확신 {} · 근거 {}"
+            ),
+            &[
+                &kind_label(lang, &upgrade.kind),
+                &level_label(lang, &upgrade.effort),
+                &level_label(lang, &upgrade.confidence),
+                &upgrade.evidence.join(list_sep),
+            ],
         ));
         if !upgrade.habit.trim().is_empty() {
-            lines.push(format!("- 接上你现在：{}", upgrade.habit.trim()));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- 接上你现在：{}",
+                    "- Attaches to what you already do: {}",
+                    "- 現在の動作につながる点：{}",
+                    "- 지금 하는 일과 연결되는 지점: {}"
+                ),
+                &[&upgrade.habit.trim()],
+            ));
         }
         if !upgrade.problem.trim().is_empty() {
-            lines.push(format!("- 现状：{}", upgrade.problem.trim()));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- 现状：{}",
+                    "- Current cost: {}",
+                    "- 現状：{}",
+                    "- 현재: {}"
+                ),
+                &[&upgrade.problem.trim()],
+            ));
         }
         if !upgrade.alternative.trim().is_empty() {
-            lines.push(format!("- 替换：{}", upgrade.alternative.trim()));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- 替换：{}",
+                    "- Replaces: {}",
+                    "- 置き換え：{}",
+                    "- 대체: {}"
+                ),
+                &[&upgrade.alternative.trim()],
+            ));
         }
-        lines.push("- 怎么开始：".to_owned());
+        lines.push(format!(
+            "- {}",
+            tr!(
+                lang,
+                "怎么开始：",
+                "How to start:",
+                "始め方：",
+                "시작 방법:"
+            )
+        ));
         for (step, action) in upgrade.actions.iter().enumerate() {
             lines.push(format!("    {}. {action}", step + 1));
         }
         if !upgrade.payoff.trim().is_empty() {
-            lines.push(format!("- 预期：{}", upgrade.payoff.trim()));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- 预期：{}",
+                    "- Expected: {}",
+                    "- 期待できる効果：{}",
+                    "- 기대 효과: {}"
+                ),
+                &[&upgrade.payoff.trim()],
+            ));
         }
         if !upgrade.risk.trim().is_empty() {
-            lines.push(format!("- 风险：{}", upgrade.risk.trim()));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- 风险：{}",
+                    "- Risk: {}",
+                    "- リスク：{}",
+                    "- 위험: {}"
+                ),
+                &[&upgrade.risk.trim()],
+            ));
         }
         for tool in &upgrade.tools {
             if let Some(item) = recommendations.iter().find(|item| &item.id == tool) {
                 for resource in &item.resources {
-                    lines.push(format!(
-                        "- 工具：[{}]({})（{}）{} 配置成本：{} 注意：{}",
-                        resource.name,
-                        resource.url,
-                        resource.kind,
-                        resource.description,
-                        resource.setup_cost,
-                        resource.permissions
+                    lines.push(fill(
+                        tr!(
+                            lang,
+                            "- 工具：[{}]({})（{}）{} 配置成本：{} 注意：{}",
+                            "- Tool: [{}]({}) ({}) {} Setup cost: {} Notes: {}",
+                            "- ツール：[{}]({})（{}）{} 設定コスト：{} 注意：{}",
+                            "- 도구: [{}]({}) ({}) {} 설정 비용: {} 주의: {}"
+                        ),
+                        &[
+                            &resource.name,
+                            &resource.url,
+                            &resource.kind,
+                            &resource.description,
+                            &resource.setup_cost,
+                            &resource.permissions,
+                        ],
                     ));
                 }
             }
         }
         if !upgrade.unverified_numbers.is_empty() {
-            lines.push(format!(
-                "> 注意：数字 {} 无法在记录中核实。",
-                upgrade.unverified_numbers.join("、")
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "> 注意：数字 {} 无法在记录中核实。",
+                    "> Note: the numbers {} cannot be verified in the records.",
+                    "> 注意：数値 {} は記録から確認できません。",
+                    "> 참고: 숫자 {}는 기록에서 확인할 수 없습니다."
+                ),
+                &[&upgrade.unverified_numbers.join(list_sep)],
             ));
         }
     }
 
     if !advice.watch.is_empty() {
-        lines.extend([String::new(), "## 下次会自动核对".to_owned()]);
-        lines.push("这些指标不需要你做任何事，下次生成时会自动对照。".to_owned());
+        lines.extend([
+            String::new(),
+            format!(
+                "## {}",
+                tr!(
+                    lang,
+                    "下次会自动核对",
+                    "Checked automatically next time",
+                    "次回に自動で照合",
+                    "다음에 자동 확인"
+                )
+            ),
+        ]);
+        lines.push(tr!(
+            lang,
+            "这些指标不需要你做任何事，下次生成时会自动对照。",
+            "Nothing to do here: these metrics are compared automatically when the next report is generated.",
+            "ここで何かをする必要はありません。次回の生成時に自動で照合します。",
+            "여기서 따로 할 일은 없습니다. 다음 보고서를 만들 때 자동으로 비교합니다."
+        ).to_owned());
         for watch in &advice.watch {
             let def = metric_def(&watch.metric);
-            let (label, unit) = def.map(|def| (def.label, def.unit)).unwrap_or(("指标", ""));
-            lines.push(format!(
-                "- {label}：今天 {}{unit}。{}",
-                fmt_number(watch.baseline.unwrap_or_default()),
-                watch.reason.trim()
+            let (label, unit) = def
+                .map(|def| (def.label(lang), def.unit(lang)))
+                .unwrap_or((tr!(lang, "指标", "Metric", "指標", "지표"), ""));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- {0}：今天 {1}{2}。{3}",
+                    "- {0}: today {1}{2}. {3}",
+                    "- {0}：今日 {1}{2}。{3}",
+                    "- {0}: 오늘 {1}{2}. {3}"
+                ),
+                &[
+                    &label,
+                    &fmt_number(watch.baseline.unwrap_or_default()),
+                    &unit,
+                    &watch.reason.trim(),
+                ],
             ));
         }
     }
@@ -574,9 +877,15 @@ pub fn render_markdown(
     if !advice.filtered.is_empty() {
         lines.extend([
             String::new(),
-            format!(
-                "> 已过滤 {} 条要求改变习惯的内容；这份报告只保留能让现有动作更省力的工具建议。",
-                advice.filtered.len()
+            fill(
+                tr!(
+                    lang,
+                    "> 已过滤 {} 条要求改变习惯的内容；这份报告只保留能让现有动作更省力的工具建议。",
+                    "> Filtered out {} behavior-change suggestions; this report keeps only tool advice that makes existing actions cheaper.",
+                    "> 習慣の変更を求める内容を {} 件除外しました。このレポートには、今の動作を楽にするツールの提案だけを残しています。",
+                    "> 습관 변경을 요구하는 내용 {}건을 제외했습니다. 이 보고서에는 지금 하는 일을 더 쉽게 만드는 도구 제안만 남겼습니다."
+                ),
+                &[&advice.filtered.len()],
             ),
         ]);
     }
@@ -591,35 +900,94 @@ pub fn render_markdown(
         .filter(|item| !used.contains(&item.id))
         .collect::<Vec<_>>();
     if !unused.is_empty() {
-        lines.extend([String::new(), "## 其他可评估的工具".to_owned()]);
+        lines.extend([
+            String::new(),
+            format!(
+                "## {}",
+                tr!(
+                    lang,
+                    "其他可评估的工具",
+                    "Other tools to consider",
+                    "その他の検討候補",
+                    "그 밖의 검토 도구"
+                )
+            ),
+        ]);
         for item in unused {
             lines.push(format!("### {}", item.title));
-            lines.push(format!("- 依据：{}", item.evidence));
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "- 依据：{}",
+                    "- Evidence: {}",
+                    "- 根拠：{}",
+                    "- 근거: {}"
+                ),
+                &[&item.evidence],
+            ));
             if !item.replaces.is_empty() {
-                lines.push(format!("- 可替代：{}", item.replaces.join("、")));
+                lines.push(fill(
+                    tr!(
+                        lang,
+                        "- 可替代：{}",
+                        "- Can replace: {}",
+                        "- 代替できるもの：{}",
+                        "- 대체 가능: {}"
+                    ),
+                    &[&item.replaces.join(list_sep)],
+                ));
             }
             for resource in &item.resources {
-                lines.push(format!(
-                    "- [{}]({})（{}）{}",
-                    resource.name, resource.url, resource.kind, resource.description
+                lines.push(fill(
+                    tr!(
+                        lang,
+                        "- [{}]({})（{}）{}",
+                        "- [{}]({}) — {}: {}",
+                        "- [{}]({})（{}）{}",
+                        "- [{}]({}) — {}: {}"
+                    ),
+                    &[
+                        &resource.name,
+                        &resource.url,
+                        &resource.kind,
+                        &resource.description,
+                    ],
                 ));
             }
         }
     }
 
     if search.enabled {
-        lines.push(format!(
-            "> 联网检索：{} 次抽象关键词查询，新增 {} 个候选，验证 {} 个链接；搜索服务不会收到行为数据。",
-            search.queries, search.added, search.verified
+        lines.push(fill(
+            tr!(
+                lang,
+                "> 联网检索：{} 次抽象关键词查询，新增 {} 个候选，验证 {} 个链接；搜索服务不会收到行为数据。",
+                "> Web search: {} abstract keyword queries, {} new candidates, {} links verified; the search service never receives behavior data.",
+                "> Web 検索：抽象キーワードで {} 回検索し、候補を {} 件追加、{} 件のリンクを確認しました。検索サービスに行動データは送信されません。",
+                "> 웹 검색: 추상 키워드 {}회 조회, 후보 {}개 추가, 링크 {}개 확인. 검색 서비스에는 행동 데이터가 전달되지 않습니다."
+            ),
+            &[&search.queries, &search.added, &search.verified],
         ));
     }
 
-    lines.extend([String::new(), "## 依据".to_owned()]);
+    lines.extend([
+        String::new(),
+        format!("## {}", tr!(lang, "依据", "Evidence", "根拠", "근거")),
+    ]);
     for item in evidence {
-        lines.push(format!("- {}：{}", item.id, item.text));
+        lines.push(fill(
+            tr!(lang, "- {}：{}", "- {}: {}", "- {}：{}", "- {}: {}"),
+            &[&item.id, &item.text],
+        ));
     }
     lines.push(String::new());
-    lines.push("工具只供人工评估，TraceBit 不会自动下载、安装或启用。".to_owned());
+    lines.push(tr!(
+        lang,
+        "工具只供人工评估，TraceBit 不会自动下载、安装或启用。",
+        "Tools are for human review only; TraceBit never downloads, installs, or enables anything automatically.",
+        "ツールは人が評価するためのものであり、TraceBit が自動でダウンロード・インストール・有効化することはありません。",
+        "도구는 사람이 검토하기 위한 것이며, TraceBit이 자동으로 다운로드·설치·활성화하지 않습니다."
+    ).to_owned());
     lines.join("\n")
 }
 #[derive(Debug)]
@@ -657,16 +1025,18 @@ impl Analyzer {
     }
 
     pub fn report_file(&self, date_key: &str) -> Result<PathBuf> {
-        validate_date_key(date_key)?;
+        let lang = self.settings.get().lang();
+        check_date(date_key, lang)?;
         Ok(self.reports_dir.join(format!("{date_key}.json")))
     }
 
     /// Writes the report as a standalone HTML page next to its JSON and returns
     /// the path. Rendered from the stored JSON, so older reports work too.
     pub fn write_html(&self, report: &Report) -> Result<PathBuf> {
-        validate_date_key(&report.date_key)?;
+        let lang = self.settings.get().lang();
+        check_date(&report.date_key, lang)?;
         let file = self.reports_dir.join(format!("{}.html", report.date_key));
-        fs::write(&file, crate::report_html::render(report))?;
+        fs::write(&file, crate::report_html::render(report, lang))?;
         Ok(file)
     }
 
@@ -743,7 +1113,8 @@ impl Analyzer {
     }
 
     pub fn mark_digest_sent(&self, date_key: &str) -> Result<()> {
-        validate_date_key(date_key)?;
+        let lang = self.settings.get().lang();
+        check_date(date_key, lang)?;
         let path = self.digest_path();
         let mut state = crate::digest::DigestState::load(&path);
         state.last_sent = Some(date_key.to_owned());
@@ -759,7 +1130,8 @@ impl Analyzer {
 
     /// Records this day in the profile and persists it.
     pub fn observe_profile(&self, date_key: &str) -> Result<Profile> {
-        validate_date_key(date_key)?;
+        let lang = self.settings.get().lang();
+        check_date(date_key, lang)?;
         let stats = self.store.day_stats(date_key, self.options())?;
         let mut profile = self.profile();
         profile.observe(date_key, &stats);
@@ -807,11 +1179,18 @@ impl Analyzer {
         url: &str,
         adopted: bool,
     ) -> Result<Profile> {
-        validate_date_key(date_key)?;
+        let lang = self.settings.get().lang();
+        check_date(date_key, lang)?;
         let stats = self.store.day_stats(date_key, self.options())?;
-        let recommendations = build_recommendations(&stats);
+        let recommendations = build_recommendations(&stats, lang);
         let Some(item) = recommendations.iter().find(|item| item.id == opportunity) else {
-            bail!("找不到这个工具候选");
+            bail!(tr!(
+                lang,
+                "找不到这个工具候选",
+                "This tool candidate was not found.",
+                "このツール候補が見つかりません。",
+                "이 도구 후보를 찾을 수 없습니다."
+            ));
         };
         let mut profile = self.profile();
         profile.record(Decision {
@@ -861,9 +1240,9 @@ impl Analyzer {
         reviews
     }
 
-    fn profile_evidence(snapshot: &ProfileSnapshot) -> Vec<Evidence> {
+    fn profile_evidence(snapshot: &ProfileSnapshot, lang: Lang) -> Vec<Evidence> {
         snapshot
-            .lines()
+            .lines(lang)
             .into_iter()
             .enumerate()
             .map(|(index, (kind, text))| Evidence {
@@ -896,7 +1275,8 @@ impl Analyzer {
 
     /// Builds the exact prompt without calling any model.
     pub fn build_context(&self, date_key: &str) -> Result<AdviceContext> {
-        validate_date_key(date_key)?;
+        let lang = self.settings.get().lang();
+        check_date(date_key, lang)?;
         let stats = self.store.day_stats(date_key, self.options())?;
         let metrics = day_metrics(&stats);
         let history_stats = self.history(date_key);
@@ -906,17 +1286,17 @@ impl Analyzer {
             .zip(&history_metrics)
             .map(|(stats, metrics)| History { stats, metrics })
             .collect::<Vec<_>>();
-        let mut evidence = build_evidence(&stats, &metrics, &history);
+        let mut evidence = build_evidence(&stats, &metrics, &history, lang);
 
         // Today is folded in memory so a preview shows exactly what generation
         // would send; generation stores the same state right after.
         let mut profile = self.profile();
         profile.observe(date_key, &stats);
-        let snapshot = profile.snapshot();
-        let profile_evidence = Self::profile_evidence(&snapshot);
+        let snapshot = profile.snapshot(lang);
+        let profile_evidence = Self::profile_evidence(&snapshot, lang);
 
         let summaries = self.summaries(date_key);
-        let all_recommendations = build_recommendations(&stats);
+        let all_recommendations = build_recommendations(&stats, lang);
         let adoptions = self.review_adoptions(&profile, &all_recommendations);
         let dismissed = profile.dismissed();
         let mut recommendations = all_recommendations
@@ -931,8 +1311,9 @@ impl Analyzer {
             &summaries,
             &profile_evidence,
             &recommendations,
-            &profile.decisions_for_prompt(),
+            &profile.decisions_for_prompt(lang),
             &adoptions,
+            lang,
         );
         evidence.extend(summaries);
         evidence.extend(profile_evidence);
@@ -943,17 +1324,24 @@ impl Analyzer {
             recommendations,
             profile: snapshot,
             adoptions,
-            system_prompt: SYSTEM_PROMPT.to_owned(),
+            system_prompt: system_prompt(lang),
             user_prompt,
         })
     }
 
     /// What would be sent to the model, for the "preview" button.
     pub fn preview_prompt(&self, date_key: &str) -> Result<String> {
+        let lang = self.settings.get().lang();
         let context = self.build_context(date_key)?;
-        Ok(format!(
-            "【系统提示】\n{}\n\n【发送的数据】\n{}",
-            context.system_prompt, context.user_prompt
+        Ok(fill(
+            tr!(
+                lang,
+                "【系统提示】\n{}\n\n【发送的数据】\n{}",
+                "[System prompt]\n{}\n\n[Data sent]\n{}",
+                "【システムプロンプト】\n{}\n\n【送信データ】\n{}",
+                "[시스템 프롬프트]\n{}\n\n[전송 데이터]\n{}"
+            ),
+            &[&context.system_prompt, &context.user_prompt],
         ))
     }
 
@@ -962,17 +1350,31 @@ impl Analyzer {
     }
 
     pub fn generate_report_as(&self, date_key: &str, source: &str) -> Result<Report> {
-        let ai = self.settings.get().ai;
+        let config = self.settings.get();
+        let lang = config.lang();
+        let ai = config.ai;
         let endpoint = ai.text_endpoint();
         // Learn this day even if the model call fails: the profile is just an
         // observation, not a generated artifact.
         self.observe_profile(date_key)?;
         let context = self.build_context(date_key)?;
         if context.stats.events == 0 {
-            bail!("当天没有记录数据");
+            bail!(tr!(
+                lang,
+                "当天没有记录数据",
+                "No activity was recorded for this day.",
+                "この日の記録がありません。",
+                "이 날 기록된 데이터가 없습니다."
+            ));
         }
         if context.stats.total_active_ms < 60_000 {
-            bail!("当天活跃时长不足 1 分钟，无法生成有意义的建议");
+            bail!(tr!(
+                lang,
+                "当天活跃时长不足 1 分钟，无法生成有意义的建议",
+                "Less than a minute of activity was recorded, so no meaningful advice can be generated.",
+                "この日のアクティブ時間が 1 分未満のため、意味のある提案を作成できません。",
+                "이 날 활동 시간이 1분 미만이라 의미 있는 제안을 만들 수 없습니다."
+            ));
         }
         let messages = json!([
             {"role": "system", "content": context.system_prompt},
@@ -984,26 +1386,45 @@ impl Analyzer {
             temperature: 0.4,
             json: true,
         };
-        let first = llm::chat(&endpoint, messages.clone(), options)?;
+        let first = llm::chat(&endpoint, messages.clone(), options, lang)?;
         let mut usage = first.usage.clone();
         let mut model = first.model.clone();
         let parsed = parse_advice(&first.content);
         let advice = match parsed {
             Some(advice) => advice,
             None if first.truncated => {
-                bail!("AI 输出被截断，请换用上下文更长或非推理模型");
+                bail!(tr!(
+                    lang,
+                    "AI 输出被截断，请换用上下文更长或非推理模型",
+                    "The AI output was truncated. Use a model with a larger context or a non-reasoning model.",
+                    "AI の出力が途中で切れました。より長いコンテキストのモデルか、非推論モデルを使ってください。",
+                    "AI 출력이 잘렸습니다. 더 긴 컨텍스트를 가진 모델이나 비추론 모델을 사용하세요."
+                ));
             }
             None => {
                 // One repair round: show the model its own output.
                 let mut repair = messages.as_array().cloned().unwrap_or_default();
                 repair.push(json!({"role": "assistant", "content": first.content}));
-                repair.push(json!({"role": "user", "content": "上面的输出不是符合要求结构的 JSON。请只输出那个 JSON 对象，不要任何其他文字。"}));
-                let second = llm::chat(&endpoint, Value::Array(repair), options)?;
+                repair.push(json!({"role": "user", "content": tr!(
+                    lang,
+                    "上面的输出不是符合要求结构的 JSON。请只输出那个 JSON 对象，不要任何其他文字。",
+                    "The output above is not JSON in the required shape. Output only that JSON object, with no other text.",
+                    "上記の出力は要求された構造の JSON ではありません。その JSON オブジェクトだけを出力し、他の文字は入れないでください。",
+                    "위 출력은 요구된 구조의 JSON이 아닙니다. 해당 JSON 객체만 출력하고 다른 텍스트는 넣지 마세요."
+                )}));
+                let second = llm::chat(&endpoint, Value::Array(repair), options, lang)?;
                 usage.prompt_tokens += second.usage.prompt_tokens;
                 usage.completion_tokens += second.usage.completion_tokens;
                 model = second.model.clone();
-                parse_advice(&second.content)
-                    .ok_or_else(|| anyhow::anyhow!("AI 两次都没有返回有效的 JSON 建议"))?
+                parse_advice(&second.content).ok_or_else(|| {
+                    anyhow::anyhow!(tr!(
+                        lang,
+                        "AI 两次都没有返回有效的 JSON 建议",
+                        "The AI did not return valid JSON advice after two attempts.",
+                        "AI が 2 回とも有効な JSON の提案を返しませんでした。",
+                        "AI가 두 번 모두 유효한 JSON 제안을 반환하지 않았습니다."
+                    ))
+                })?
             }
         };
         let evidence_ids = context
@@ -1022,8 +1443,15 @@ impl Analyzer {
                 known.insert(fmt_number(value));
             }
         }
-        let advice = validate_advice(advice, &evidence_ids, &tool_ids, &known, &context.metrics)?;
-        let enriched = enrich_recommendations(&context.recommendations, &ai);
+        let advice = validate_advice(
+            advice,
+            &evidence_ids,
+            &tool_ids,
+            &known,
+            &context.metrics,
+            lang,
+        )?;
+        let enriched = enrich_recommendations(&context.recommendations, &ai, lang);
         let markdown = render_markdown(
             date_key,
             &advice,
@@ -1032,6 +1460,7 @@ impl Analyzer {
             &enriched.recommendations,
             &enriched.search,
             &context.adoptions,
+            lang,
         );
         let input_hash = format!(
             "{:x}",
@@ -1092,6 +1521,7 @@ impl Analyzer {
     }
 
     pub fn test_connection(&self) -> Result<(String, String)> {
+        let lang = self.settings.get().lang();
         let ai = self.settings.get().ai;
         let output = llm::chat(
             &ai.text_endpoint(),
@@ -1101,11 +1531,21 @@ impl Analyzer {
                 timeout_ms: 30_000,
                 ..Default::default()
             },
+            lang,
         )?;
         let mut model = output.model;
         if ai.screenshot_analysis {
-            let vision = crate::intervals::test_vision(&ai)?;
-            model = format!("{model}；视觉 {vision}");
+            let vision = crate::intervals::test_vision(&ai, lang)?;
+            model = fill(
+                tr!(
+                    lang,
+                    "{0}；视觉 {1}",
+                    "{0}; vision {1}",
+                    "{0}、ビジョン {1}",
+                    "{0}; 비전 {1}"
+                ),
+                &[&model, &vision],
+            );
         }
         Ok((output.content, model))
     }
@@ -1183,6 +1623,9 @@ mod tests {
     ) -> (Arc<Settings>, Arc<DayStore>, Analyzer, String, i64) {
         let store = Arc::new(DayStore::new(temp.path().join("data")).unwrap());
         let settings = Arc::new(Settings::load(temp.path().join("user")));
+        // Chinese assertions in these tests rely on the stored report and
+        // evidence being generated in Chinese.
+        settings.patch(&json!({"app": {"language": "zh"}})).unwrap();
         let (date_key, noon) = noon();
         seed(&store, noon);
         let analyzer =
@@ -1293,6 +1736,53 @@ mod tests {
     }
 
     #[test]
+    fn guard_covers_every_output_language_without_blocks_on_steps() {
+        for text in [
+            "Stop using Slack for status updates",
+            "Reduce your screen time during deep work",
+            "Turn off notifications while writing",
+            "通知をオフにしましょう",
+            "使用時間を減らす",
+            "알림을 끄세요",
+            "사용 시간을 줄이세요",
+        ] {
+            assert!(pushes_behavior(text), "should block: {text}");
+        }
+        for text in [
+            "Reduce steps with a task runner",
+            "One keystroke opens the command palette",
+            "手順を減らすタスクランナー",
+            "단계를 줄이는 설정",
+        ] {
+            assert!(!pushes_behavior(text), "should keep: {text}");
+        }
+    }
+
+    #[test]
+    fn enums_normalize_from_both_key_sets_and_labels_follow_language() {
+        assert_eq!(
+            normalize_choice("工具", &UPGRADE_TYPES, &LEGACY_KINDS, "tool"),
+            "tool"
+        );
+        assert_eq!(
+            normalize_choice("automation", &UPGRADE_TYPES, &LEGACY_KINDS, "tool"),
+            "automation"
+        );
+        assert_eq!(
+            normalize_choice("高", &LEVELS, &LEGACY_LEVELS, "medium"),
+            "high"
+        );
+        assert_eq!(
+            normalize_choice("medium", &LEVELS, &LEGACY_LEVELS, "medium"),
+            "medium"
+        );
+        assert_eq!(kind_label(Lang::En, "工具"), "Tool");
+        assert_eq!(kind_label(Lang::Zh, "integration"), "集成");
+        assert_eq!(level_label(Lang::Ko, "low"), "낮음");
+        assert_eq!(level_label(Lang::Ja, "high"), "高");
+    }
+
+    #[test]
     fn invalid_json_gets_one_repair_round() {
         let (url, rx) = mock::serve(vec![
             mock::completion("m", "这是一些散文，不是 JSON"),
@@ -1351,7 +1841,7 @@ mod tests {
         analyzer.observe_profile(&date_key).unwrap();
         let profile = analyzer.profile();
         assert_eq!(profile.days.len(), 1);
-        let snapshot = profile.snapshot();
+        let snapshot = profile.snapshot(Lang::Zh);
         assert_eq!(snapshot.days, 1);
         assert!(snapshot.rhythm.active_hours > 0);
     }

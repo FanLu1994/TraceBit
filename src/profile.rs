@@ -11,8 +11,9 @@
 
 use crate::{
     categories::{is_productive, normalize_proc},
+    i18n::{Lang, fill, pick},
     insights::title_key,
-    recommendations::tool_role,
+    recommendations::{role_label, tool_role},
     recorder::SENSITIVE_TITLE,
     redact::{ai_title, clean_title},
     store::{DayStats, hhmm, now_ms},
@@ -199,10 +200,11 @@ pub enum DecisionKind {
 }
 
 impl DecisionKind {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
+        use crate::tr;
         match self {
-            Self::Adopted => "已采纳",
-            Self::Dismissed => "不需要",
+            Self::Adopted => tr!(lang, "已采纳", "Adopted", "採用済み", "채택함"),
+            Self::Dismissed => tr!(lang, "不需要", "Not needed", "不要", "불필요"),
         }
     }
 }
@@ -299,7 +301,8 @@ impl Profile {
     }
 
     /// Text for the model: what the person already told us about tools.
-    pub fn decisions_for_prompt(&self) -> String {
+    pub fn decisions_for_prompt(&self, lang: Lang) -> String {
+        use crate::tr;
         if self.decisions.is_empty() {
             return String::new();
         }
@@ -312,32 +315,52 @@ impl Profile {
                 decision.resource.clone()
             };
             match decision.kind {
-                Some(DecisionKind::Adopted) => adopted.push(format!(
-                    "{}（{} 起，来自「{}」）",
-                    name, decision.date_key, decision.title
+                Some(DecisionKind::Adopted) => adopted.push(fill(
+                    tr!(
+                        lang,
+                        "{}（{} 起，来自「{}」）",
+                        "{} (since {}, from “{}”)",
+                        "{}（{} から、「{}」より）",
+                        "{} ({}부터, “{}”에서)"
+                    ),
+                    &[&name, &decision.date_key, &decision.title],
                 )),
                 Some(DecisionKind::Dismissed) => dismissed.push(name),
                 None => {}
             }
         }
+        let list = pick(lang, ["、", ", ", "、", ", "]);
         let mut lines = Vec::new();
         if !adopted.is_empty() {
-            lines.push(format!(
-                "已采纳：{}。这些不要再当作新发现推荐，只在成本变化时提。",
-                adopted.join("、")
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "已采纳：{}。这些不要再当作新发现推荐，只在成本变化时提。",
+                    "Adopted: {}. Do not pitch them as new findings; mention them only when the cost changes.",
+                    "採用済み：{}。これらは新発見として再提案せず、コストが変わったときだけ触れてください。",
+                    "채택함: {}. 새로운 발견으로 다시 제안하지 말고 비용이 바뀔 때만 언급하세요."
+                ),
+                &[&adopted.join(list)],
             ));
         }
         if !dismissed.is_empty() {
-            lines.push(format!(
-                "已明确不需要：{}。不要再次推荐。",
-                dismissed.join("、")
+            lines.push(fill(
+                tr!(
+                    lang,
+                    "已明确不需要：{}。不要再次推荐。",
+                    "Explicitly not needed: {}. Never recommend them again.",
+                    "明示的に不要：{}。再提案しないでください。",
+                    "명시적으로 불필요: {}. 다시 제안하지 마세요."
+                ),
+                &[&dismissed.join(list)],
             ));
         }
         lines.join("\n")
     }
 
     /// Folds the retained days into a stable, human-readable picture.
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self, lang: Lang) -> Snapshot {
+        use crate::tr;
         let days = self.days.iter().collect::<Vec<_>>();
         if days.is_empty() {
             return Snapshot::default();
@@ -353,7 +376,10 @@ impl Profile {
         let span = if self.days.len() == 1 {
             first_day.clone()
         } else {
-            format!("{first_day} 至 {last_day}")
+            fill(
+                tr!(lang, "{} 至 {}", "{} to {}", "{}〜{}", "{} ~ {}"),
+                &[&first_day, &last_day],
+            )
         };
 
         let mut tools: BTreeMap<String, (String, String, i64, usize)> = BTreeMap::new();
@@ -372,11 +398,11 @@ impl Profile {
             .into_iter()
             .map(|(proc, (name, role, total_min, present))| ToolSummary {
                 name,
-                role,
+                role: role_label(lang, &role).to_owned(),
                 days: present,
                 total_min,
                 avg_min: (total_min as f64 / day_count as f64).round() as i64,
-                trend: trend_of(&days, &proc).to_owned(),
+                trend: trend_of(&days, &proc, lang).to_owned(),
             })
             .filter(|tool| tool.avg_min >= 2)
             .collect::<Vec<_>>();
@@ -468,12 +494,13 @@ impl Profile {
             loops,
             themes,
             sites,
-            rhythm: rhythm_of(&days),
+            rhythm: rhythm_of(&days, lang),
         }
     }
 }
 
-fn trend_of(days: &[(&String, &DayRecord)], proc: &str) -> &'static str {
+fn trend_of(days: &[(&String, &DayRecord)], proc: &str, lang: Lang) -> &'static str {
+    use crate::tr;
     if days.len() < 4 {
         return "";
     }
@@ -491,15 +518,19 @@ fn trend_of(days: &[(&String, &DayRecord)], proc: &str) -> &'static str {
     let recent = average(&days[split..]);
     let earlier = average(&days[..split]);
     if earlier < 1.0 {
-        return if recent >= 5.0 { "近期出现" } else { "" };
+        return if recent >= 5.0 {
+            tr!(lang, "近期出现", "new this period", "最近出現", "최근 등장")
+        } else {
+            ""
+        };
     }
     let change = (recent - earlier) / earlier;
     if change > 0.25 {
-        "近期上升"
+        tr!(lang, "近期上升", "trending up", "最近増加", "최근 증가")
     } else if change < -0.25 {
-        "近期下降"
+        tr!(lang, "近期下降", "trending down", "最近減少", "최근 감소")
     } else {
-        "近期稳定"
+        tr!(lang, "近期稳定", "steady", "最近横ばい", "최근 안정")
     }
 }
 
@@ -512,7 +543,8 @@ fn median_time(values: &mut Vec<i64>) -> Option<String> {
     Some(hhmm(values[values.len() / 2]))
 }
 
-fn rhythm_of(days: &[(&String, &DayRecord)]) -> Rhythm {
+fn rhythm_of(days: &[(&String, &DayRecord)], lang: Lang) -> Rhythm {
+    use crate::tr;
     let count = days.len().max(1) as f64;
     let mut starts = days
         .iter()
@@ -565,8 +597,14 @@ fn rhythm_of(days: &[(&String, &DayRecord)]) -> Rhythm {
     Rhythm {
         start: median_time(&mut starts).unwrap_or_default(),
         end: median_time(&mut ends).unwrap_or_default(),
-        window: format!("{best}–{} 点", best + 2),
-        focus_window: format!("{focus_best}–{} 点", focus_best + 2),
+        window: fill(
+            tr!(lang, "{}–{} 点", "{}–{}", "{}〜{} 時", "{}–{}시"),
+            &[&best, &(best + 2)],
+        ),
+        focus_window: fill(
+            tr!(lang, "{}–{} 点", "{}–{}", "{}〜{} 時", "{}–{}시"),
+            &[&focus_best, &(focus_best + 2)],
+        ),
         focus_min: focus_avg.round() as i64,
         active_hours,
         weekend_share: (weekend_min as f64 / total_min as f64 * 100.0).round() as i64,
@@ -651,52 +689,84 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Prompt lines; the first element is the evidence kind.
-    pub fn lines(&self) -> Vec<(&'static str, String)> {
+    pub fn lines(&self, lang: Lang) -> Vec<(&'static str, String)> {
+        use crate::tr;
+        let list = pick(lang, ["、", ", ", "、", ", "]);
+        let clause = pick(lang, ["；", "; ", "、", "; "]);
         let mut lines = Vec::new();
         if self.days == 0 {
             return lines;
         }
         if !self.tools.is_empty() {
+            let tools = self
+                .tools
+                .iter()
+                .take(6)
+                .map(|tool| {
+                    let mut text = fill(
+                        tr!(
+                            lang,
+                            "{}（{}，日均 {} 分钟",
+                            "{} ({}, {} min/day",
+                            "{}（{}、1 日平均 {} 分",
+                            "{} ({}, 일평균 {}분"
+                        ),
+                        &[&tool.name, &tool.role, &tool.avg_min],
+                    );
+                    if !tool.trend.is_empty() {
+                        text.push_str(list);
+                        text.push_str(&tool.trend);
+                    }
+                    text.push_str(pick(lang, ["）", ")", "）", ")"]));
+                    text
+                })
+                .collect::<Vec<_>>()
+                .join(list);
             lines.push((
                 "tools",
-                format!(
-                    "主力工具（{} 个记录日）：{}。",
-                    self.days,
-                    self.tools
-                        .iter()
-                        .take(6)
-                        .map(|tool| {
-                            let mut text =
-                                format!("{}（{}，日均 {} 分钟", tool.name, tool.role, tool.avg_min);
-                            if !tool.trend.is_empty() {
-                                text.push('，');
-                                text.push_str(&tool.trend);
-                            }
-                            text.push('）');
-                            text
-                        })
-                        .collect::<Vec<_>>()
-                        .join("、")
+                fill(
+                    tr!(
+                        lang,
+                        "主力工具（{} 个记录日）：{}。",
+                        "Main tools ({} recorded days): {}.",
+                        "主力ツール（記録 {} 日）：{}。",
+                        "주요 도구 (기록 {}일): {}."
+                    ),
+                    &[&self.days, &tools],
                 ),
             ));
         }
         if !self.loops.is_empty() {
+            let loops = self
+                .loops
+                .iter()
+                .take(4)
+                .map(|loop_| {
+                    let per_day = format!("{:.1}", loop_.per_day);
+                    fill(
+                        tr!(
+                            lang,
+                            "{} ↔ {} 日均 {} 次，其中一侧平均只停留 {} 秒",
+                            "{} ↔ {} {} times/day, with one side staying only about {} s",
+                            "{} ↔ {} 1 日平均 {} 回、片側の平均滞在は約 {} 秒",
+                            "{} ↔ {} 일평균 {}회, 한쪽 평균 체류 약 {}초"
+                        ),
+                        &[&loop_.a, &loop_.b, &per_day, &loop_.dwell_secs()],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(clause);
             lines.push((
                 "loops",
-                format!(
-                    "日常来回：{}。",
-                    self.loops
-                        .iter()
-                        .take(4)
-                        .map(|loop_| format!(
-                            "{} ↔ {} 日均 {:.1} 次，其中一侧平均只停留 {} 秒",
-                            loop_.a,
-                            loop_.b,
-                            loop_.per_day,
-                            loop_.dwell_secs()
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("；")
+                fill(
+                    tr!(
+                        lang,
+                        "日常来回：{}。",
+                        "Daily back-and-forth: {}.",
+                        "日々の往復：{}。",
+                        "일상 왕복: {}."
+                    ),
+                    &[&loops],
                 ),
             ));
         }
@@ -704,38 +774,117 @@ impl Snapshot {
         let mut parts = Vec::new();
         if !rhythm.start.is_empty() {
             parts.push(if rhythm.end.is_empty() {
-                format!("从 {} 开始活跃", rhythm.start)
+                fill(
+                    tr!(
+                        lang,
+                        "从 {} 开始活跃",
+                        "Active from {}",
+                        "{} 頃から活動",
+                        "{}경부터 활동"
+                    ),
+                    &[&rhythm.start],
+                )
             } else {
-                format!("常在 {}–{} 活跃", rhythm.start, rhythm.end)
+                fill(
+                    tr!(
+                        lang,
+                        "常在 {}–{} 活跃",
+                        "Usually active {}–{}",
+                        "{}〜{} によく活動",
+                        "보통 {}–{} 활동"
+                    ),
+                    &[&rhythm.start, &rhythm.end],
+                )
             });
         } else {
-            parts.push(format!("最活跃时段 {}", rhythm.window));
+            parts.push(fill(
+                tr!(
+                    lang,
+                    "最活跃时段 {}",
+                    "Peak hours {}",
+                    "最も活発な時間帯 {}",
+                    "가장 활발한 시간대 {}"
+                ),
+                &[&rhythm.window],
+            ));
         }
         if rhythm.active_hours > 0 {
-            parts.push(format!("有 {} 个活跃小时", rhythm.active_hours));
+            parts.push(fill(
+                tr!(
+                    lang,
+                    "有 {} 个活跃小时",
+                    "{} active hours",
+                    "活発な時間帯が {} 時間",
+                    "활동 시간대 {}시간"
+                ),
+                &[&rhythm.active_hours],
+            ));
         }
-        parts.push(format!(
-            "产出最集中在 {}（日均 {} 分钟）",
-            rhythm.focus_window, rhythm.focus_min
+        parts.push(fill(
+            tr!(
+                lang,
+                "产出最集中在 {}（日均 {} 分钟）",
+                "Focus time concentrates in {} ({} min/day)",
+                "集中作業は {} に集中（1 日平均 {} 分）",
+                "집중 작업은 {}에 집중 (일평균 {}분)"
+            ),
+            &[&rhythm.focus_window, &rhythm.focus_min],
         ));
         if rhythm.weekend_share > 0 {
-            parts.push(format!("周末占 {}% 的活跃时间", rhythm.weekend_share));
+            parts.push(fill(
+                tr!(
+                    lang,
+                    "周末占 {}% 的活跃时间",
+                    "Weekends are {}% of active time",
+                    "週末が活動時間の {}%",
+                    "주말이 활동 시간의 {}%"
+                ),
+                &[&rhythm.weekend_share],
+            ));
         }
-        lines.push(("rhythm", format!("工作节奏：{}。", parts.join("；"))));
+        lines.push((
+            "rhythm",
+            fill(
+                tr!(
+                    lang,
+                    "工作节奏：{}。",
+                    "Work rhythm: {}.",
+                    "作業リズム：{}。",
+                    "업무 리듬: {}."
+                ),
+                &[&parts.join(clause)],
+            ),
+        ));
         if !self.themes.is_empty() {
+            let themes = self
+                .themes
+                .iter()
+                .take(5)
+                .map(|theme| {
+                    fill(
+                        tr!(
+                            lang,
+                            "{}（{} 天，共 {} 分钟）",
+                            "{} ({} days, {} min total)",
+                            "{}（{} 日、計 {} 分）",
+                            "{} ({}일, 총 {}분)"
+                        ),
+                        &[&theme.label, &theme.days, &theme.total_min],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(list);
             lines.push((
                 "themes",
-                format!(
-                    "反复处理的内容：{}。",
-                    self.themes
-                        .iter()
-                        .take(5)
-                        .map(|theme| format!(
-                            "{}（{} 天，共 {} 分钟）",
-                            theme.label, theme.days, theme.total_min
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("、")
+                fill(
+                    tr!(
+                        lang,
+                        "反复处理的内容：{}。",
+                        "Recurring topics: {}.",
+                        "繰り返し扱う内容：{}。",
+                        "반복적으로 다루는 내용: {}."
+                    ),
+                    &[&themes],
                 ),
             ));
         }
@@ -787,7 +936,7 @@ mod tests {
         let first = serde_json::to_string(&profile.days).unwrap();
         assert!(profile.observe("2026-01-01", &stats));
         assert_eq!(first, serde_json::to_string(&profile.days).unwrap());
-        let snapshot = profile.snapshot();
+        let snapshot = profile.snapshot(Lang::Zh);
         assert_eq!(snapshot.days, 1);
         assert!(snapshot.tools.iter().any(|tool| tool.name == "VS Code"));
         assert!(
@@ -796,10 +945,10 @@ mod tests {
                 .iter()
                 .any(|loop_| loop_.a == "VS Code" || loop_.b == "VS Code")
         );
-        assert!(!snapshot.lines().is_empty());
+        assert!(!snapshot.lines(Lang::Zh).is_empty());
         assert!(
             snapshot
-                .lines()
+                .lines(Lang::Zh)
                 .iter()
                 .all(|(_, text)| !text.contains("secret"))
         );
@@ -829,7 +978,33 @@ mod tests {
         });
         assert!(profile.dismissed().is_empty());
         assert_eq!(profile.adopted().len(), 1);
-        assert!(profile.decisions_for_prompt().contains("已采纳"));
+        assert!(profile.decisions_for_prompt(Lang::Zh).contains("已采纳"));
+        assert_eq!(DecisionKind::Adopted.label(Lang::En), "Adopted");
+    }
+
+    #[test]
+    fn snapshot_text_follows_the_language() {
+        let stats = day();
+        let mut profile = Profile::default();
+        profile.observe("2026-01-01", &stats);
+        let snapshot = profile.snapshot(Lang::En);
+        assert!(
+            snapshot.tools.iter().all(|tool| tool.role == "Browser"
+                || tool.role == "Editor"
+                || tool.role == "Other")
+        );
+        let text = snapshot
+            .lines(Lang::En)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Main tools"));
+        assert!(
+            !text
+                .chars()
+                .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+        );
     }
 
     #[test]

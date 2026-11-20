@@ -1,7 +1,9 @@
 use crate::{
+    i18n::{Lang, fill},
     recommendations::{Recommendation, Resource, SearchSummary},
     settings::AiSettings,
     store::now_ms,
+    tr,
 };
 use anyhow::{Result, bail};
 use regex::{Captures, Regex};
@@ -181,13 +183,19 @@ pub fn allowed_discovery(value: &str) -> bool {
     .contains(&parts[0].to_lowercase().as_str())
 }
 
-pub fn assert_abstract_query(query: &str) -> Result<String> {
+pub fn assert_abstract_query(query: &str, lang: Lang) -> Result<String> {
     static PRIVATE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)https?://|www\.|(?:[a-z0-9-]+\.)+[a-z]{2,}|[@\r\n]").unwrap()
     });
     let query = query.trim();
     if query.is_empty() || query.len() > 120 || PRIVATE.is_match(query) {
-        bail!("搜索关键词不符合抽象资源查询约束");
+        bail!(tr!(
+            lang,
+            "搜索关键词不符合抽象资源查询约束",
+            "Search keywords must stay an abstract resource query",
+            "検索キーワードが抽象的なリソース検索の条件を満たしていません",
+            "검색 키워드가 추상 리소스 검색 조건에 맞지 않습니다"
+        ));
     }
     Ok(query.to_owned())
 }
@@ -240,8 +248,8 @@ fn client(timeout_ms: u64) -> Result<Client> {
         .build()?)
 }
 
-pub fn search_web(query: &str, ai: &AiSettings) -> Result<Vec<SearchResult>> {
-    let query = assert_abstract_query(query)?;
+pub fn search_web(query: &str, ai: &AiSettings, lang: Lang) -> Result<Vec<SearchResult>> {
+    let query = assert_abstract_query(query, lang)?;
     let provider = if ai.search_provider.is_empty() {
         "duckduckgo"
     } else {
@@ -250,7 +258,13 @@ pub fn search_web(query: &str, ai: &AiSettings) -> Result<Vec<SearchResult>> {
     if provider == "brave" {
         let api_key = ai.search_api_key.trim();
         if api_key.is_empty() {
-            bail!("Brave Search 需要单独配置搜索 API Key");
+            bail!(tr!(
+                lang,
+                "Brave Search 需要单独配置搜索 API Key",
+                "Brave Search needs its own search API key",
+                "Brave Search には専用の検索 API キー設定が必要です",
+                "Brave Search에는 별도의 검색 API 키 설정이 필요합니다"
+            ));
         }
         let endpoint = ai
             .search_endpoint
@@ -264,7 +278,16 @@ pub fn search_web(query: &str, ai: &AiSettings) -> Result<Vec<SearchResult>> {
             .header("X-Subscription-Token", api_key)
             .send()?;
         if !response.status().is_success() {
-            bail!("Brave Search 返回 {}", response.status());
+            bail!(fill(
+                tr!(
+                    lang,
+                    "Brave Search 返回 {}",
+                    "Brave Search returned {}",
+                    "Brave Search が {} を返しました",
+                    "Brave Search가 {}을(를) 반환했습니다"
+                ),
+                &[&response.status()]
+            ));
         }
         let data: Value = response.json()?;
         return Ok(data
@@ -297,7 +320,16 @@ pub fn search_web(query: &str, ai: &AiSettings) -> Result<Vec<SearchResult>> {
             .collect());
     }
     if provider != "duckduckgo" {
-        bail!("不支持的搜索服务：{provider}");
+        bail!(fill(
+            tr!(
+                lang,
+                "不支持的搜索服务：{}",
+                "Unsupported search provider: {}",
+                "未対応の検索サービス：{}",
+                "지원하지 않는 검색 서비스: {}"
+            ),
+            &[&provider]
+        ));
     }
     let endpoint = ai
         .search_endpoint
@@ -311,13 +343,22 @@ pub fn search_web(query: &str, ai: &AiSettings) -> Result<Vec<SearchResult>> {
         .header("User-Agent", "TraceBit/0.3 (local resource search)")
         .send()?;
     if !response.status().is_success() {
-        bail!("DuckDuckGo 返回 {}", response.status());
+        bail!(fill(
+            tr!(
+                lang,
+                "DuckDuckGo 返回 {}",
+                "DuckDuckGo returned {}",
+                "DuckDuckGo が {} を返しました",
+                "DuckDuckGo가 {}을(를) 반환했습니다"
+            ),
+            &[&response.status()]
+        ));
     }
     let html = response.text()?;
     Ok(parse_duckduckgo(&truncate_chars(&html, 1_500_000)))
 }
 
-fn verify_resource(resource: &mut Resource) -> bool {
+fn verify_resource(resource: &mut Resource, lang: Lang) -> bool {
     let result = client(6_000).and_then(|client| {
         client
             .head(&resource.url)
@@ -329,18 +370,48 @@ fn verify_resource(resource: &mut Resource) -> bool {
         Ok(response) if response.status().is_success() => {
             resource.verified_at = Some(now_ms());
             resource.verification = if resource.source == "curated" {
-                "官方来源可访问".to_owned()
+                tr!(
+                    lang,
+                    "官方来源可访问",
+                    "Official source is reachable",
+                    "公式ソースに接続できます",
+                    "공식 출처에 접속할 수 있습니다"
+                )
+                .to_owned()
             } else {
-                "搜索链接可访问，仍需人工审核".to_owned()
+                tr!(
+                    lang,
+                    "搜索链接可访问，仍需人工审核",
+                    "Search link is reachable but still needs manual review",
+                    "検索リンクには接続できますが、人の確認が必要です",
+                    "검색 링크에 접속되지만 직접 검토가 필요합니다"
+                )
+                .to_owned()
             };
             true
         }
         Ok(response) => {
-            resource.verification = format!("链接返回 {}，请手动检查", response.status());
+            resource.verification = fill(
+                tr!(
+                    lang,
+                    "链接返回 {}，请手动检查",
+                    "Link returned {}; please check manually",
+                    "リンクが {} を返しました。手動で確認してください",
+                    "링크가 {}을(를) 반환했습니다. 직접 확인하세요"
+                ),
+                &[&response.status()],
+            );
             false
         }
         Err(_) => {
-            resource.verification = "链接暂时无法验证，请手动检查".to_owned();
+            resource.verification = tr!(
+                lang,
+                "链接暂时无法验证，请手动检查",
+                "Link could not be verified right now; please check manually",
+                "現在リンクを検証できません。手動で確認してください",
+                "지금은 링크를 검증할 수 없습니다. 직접 확인하세요"
+            )
+            .to_owned();
             false
         }
     }
@@ -349,13 +420,15 @@ fn verify_resource(resource: &mut Resource) -> bool {
 pub fn enrich_recommendations(
     local: &[Recommendation],
     ai: &AiSettings,
+    lang: Lang,
 ) -> EnrichedRecommendations {
-    enrich_with_search(local, ai, search_web)
+    enrich_with_search(local, ai, lang, |query, ai| search_web(query, ai, lang))
 }
 
 pub fn enrich_with_search(
     local: &[Recommendation],
     ai: &AiSettings,
+    lang: Lang,
     search_impl: impl Fn(&str, &AiSettings) -> Result<Vec<SearchResult>>,
 ) -> EnrichedRecommendations {
     let mut recommendations = local.to_vec();
@@ -385,23 +458,63 @@ pub fn enrich_with_search(
                         opportunity.resources.push(Resource {
                             id: format!("web-{}", opportunity.id),
                             name: clean_text(&candidate.title, 80),
-                            kind: "联网候选".to_owned(),
+                            kind: tr!(
+                                lang,
+                                "联网候选",
+                                "Web candidate",
+                                "Web 候補",
+                                "웹 후보"
+                            )
+                            .to_owned(),
                             url: candidate.url,
                             description: {
                                 let description = clean_text(&candidate.description, 180);
                                 if description.is_empty() {
-                                    "联网搜索发现的候选资源，需要人工核对与上述操作的匹配度。"
-                                        .to_owned()
+                                    tr!(
+                                        lang,
+                                        "联网搜索发现的候选资源，需要人工核对与上述操作的匹配度。",
+                                        "Candidate found by web search; check by hand how well it fits the workflow above.",
+                                        "Web 検索で見つかった候補です。上記の操作との相性を人の目で確認する必要があります。",
+                                        "웹 검색에서 찾은 후보로, 위 작업과의 적합성을 직접 확인해야 합니다."
+                                    )
+                                    .to_owned()
                                 } else {
                                     description
                                 }
                             },
-                            benefit: "补充本地精选之外的候选，不保证适用。".to_owned(),
-                            setup_cost: "待评估".to_owned(),
-                            permissions: "只访问公开页面；安装前审阅源码、权限、发布方和维护状态。"
-                                .to_owned(),
+                            benefit: tr!(
+                                lang,
+                                "补充本地精选之外的候选，不保证适用。",
+                                "Adds candidates beyond the local picks; usefulness isn't guaranteed.",
+                                "ローカルの厳選候補を補うもので、適合は保証されません。",
+                                "로컬 엄선 후보를 보완하며 적합성은 보장되지 않습니다."
+                            )
+                            .to_owned(),
+                            setup_cost: tr!(
+                                lang,
+                                "待评估",
+                                "To be assessed",
+                                "要評価",
+                                "평가 필요"
+                            )
+                            .to_owned(),
+                            permissions: tr!(
+                                lang,
+                                "只访问公开页面；安装前审阅源码、权限、发布方和维护状态。",
+                                "Accesses public pages only; review source, permissions, publisher and maintenance status before installing.",
+                                "公開ページのみにアクセスします。インストール前にソース、権限、公開元、保守状況を確認してください。",
+                                "공개 페이지만 접근합니다. 설치 전에 소스, 권한, 배포자, 유지보수 상태를 검토하세요."
+                            )
+                            .to_owned(),
                             source: "web".to_owned(),
-                            verification: "联网搜索发现，尚未人工复核".to_owned(),
+                            verification: tr!(
+                                lang,
+                                "联网搜索发现，尚未人工复核",
+                                "Found by web search, not yet manually reviewed",
+                                "Web 検索で見つかったもので、まだ人の確認はありません",
+                                "웹 검색에서 찾은 것으로 아직 직접 검토하지 않았습니다"
+                            )
+                            .to_owned(),
                             verified_at: None,
                         });
                         search.added += 1;
@@ -410,7 +523,14 @@ pub fn enrich_with_search(
                 Err(error) => search.errors.push({
                     let message = clean_text(&error.to_string(), 160);
                     if message.is_empty() {
-                        "搜索失败".to_owned()
+                        tr!(
+                            lang,
+                            "搜索失败",
+                            "Search failed",
+                            "検索に失敗しました",
+                            "검색 실패"
+                        )
+                        .to_owned()
                     } else {
                         message
                     }
@@ -438,7 +558,7 @@ pub fn enrich_with_search(
                                 search.verified += 1;
                             }
                         } else {
-                            let verified = verify_resource(resource);
+                            let verified = verify_resource(resource, lang);
                             if verified {
                                 search.verified += 1;
                             }
@@ -466,12 +586,12 @@ mod tests {
     #[test]
     fn abstract_queries_cannot_contain_private_locations() {
         assert_eq!(
-            assert_abstract_query("open source Git GUI Windows").unwrap(),
+            assert_abstract_query("open source Git GUI Windows", Lang::Zh).unwrap(),
             "open source Git GUI Windows"
         );
-        assert!(assert_abstract_query("https://private.example.com/secret").is_err());
-        assert!(assert_abstract_query("secret@example.com").is_err());
-        assert!(assert_abstract_query("private.example.com").is_err());
+        assert!(assert_abstract_query("https://private.example.com/secret", Lang::Zh).is_err());
+        assert!(assert_abstract_query("secret@example.com", Lang::Zh).is_err());
+        assert!(assert_abstract_query("private.example.com", Lang::Zh).is_err());
     }
 
     #[test]
@@ -507,7 +627,7 @@ mod tests {
             verify_sources: Some(false),
             ..Default::default()
         };
-        let result = enrich_with_search(&[recommendation], &ai, |_, _| bail!("offline"));
+        let result = enrich_with_search(&[recommendation], &ai, Lang::Zh, |_, _| bail!("offline"));
         assert_eq!(result.search.errors.len(), 1);
         assert_eq!(result.recommendations.len(), 1);
         assert!(result.recommendations[0].resources.is_empty());

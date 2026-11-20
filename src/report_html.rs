@@ -2,7 +2,8 @@
 //! external assets) that opens in the default browser.
 
 use crate::{
-    analyzer::{AdoptionReview, Report, Upgrade},
+    analyzer::{AdoptionReview, Report, Upgrade, kind_label, level_label},
+    i18n::{Lang, fill, pick},
     insights::metric_def,
     profile::Snapshot,
     store::local_datetime,
@@ -50,21 +51,60 @@ fn evidence_refs(ids: &[String]) -> String {
     format!(r#"<span class="refs">{links}</span>"#)
 }
 
-fn unverified_note(numbers: &[String], prefix: &str) -> String {
+/// `overall` marks the note for the description block instead of one card.
+fn unverified_note(numbers: &[String], lang: Lang, overall: bool) -> String {
+    use crate::tr;
     if numbers.is_empty() {
         return String::new();
     }
-    format!(
-        r#"<p class="warn">{prefix}{} 无法在记录中核实，请谨慎参考。</p>"#,
-        esc(&numbers.join("、"))
-    )
+    let numbers = esc(&numbers.join(pick(lang, ["、", ", ", "、", ", "])));
+    let text = if overall {
+        fill(
+            tr!(
+                lang,
+                "以上描述中的数字 {} 无法在记录中核实，请谨慎参考。",
+                "Numbers in the description above ({}) could not be verified in the records; treat them with care.",
+                "上記の説明にある数値 {} は記録から確認できませんでした。参考程度にご覧ください。",
+                "위 설명에 나온 숫자 {}는 기록에서 확인할 수 없습니다. 참고만 하세요."
+            ),
+            &[&numbers],
+        )
+    } else {
+        fill(
+            tr!(
+                lang,
+                "数字 {} 无法在记录中核实，请谨慎参考。",
+                "The numbers {} could not be verified in the records; treat them with care.",
+                "数値 {} は記録から確認できませんでした。参考程度にご覧ください。",
+                "숫자 {}는 기록에서 확인할 수 없습니다. 참고만 하세요."
+            ),
+            &[&numbers],
+        )
+    };
+    format!(r#"<p class="warn">{text}</p>"#)
 }
 
-fn profile_html(profile: &Snapshot) -> String {
+fn profile_html(profile: &Snapshot, lang: Lang) -> String {
+    use crate::tr;
     let mut html = format!(
-        r#"<section class="profile"><div class="profile-head"><h2>工作画像 · 本地学习</h2><span class="muted">{} 个记录日 · {}</span></div>"#,
-        profile.days,
-        esc(&profile.span)
+        r#"<section class="profile"><div class="profile-head"><h2>{}</h2><span class="muted">{}</span></div>"#,
+        tr!(
+            lang,
+            "工作画像 · 本地学习",
+            "Work profile · learned locally",
+            "ワークプロファイル · ローカル学習",
+            "업무 프로필 · 로컬 학습"
+        ),
+        fill(
+            tr!(
+                lang,
+                "{} 个记录日 · {}",
+                "{} recorded days · {}",
+                "記録 {} 日 · {}",
+                "기록 {}일 · {}"
+            ),
+            &[&profile.days, &esc(&profile.span)]
+        )
     );
     if !profile.tools.is_empty() {
         html.push_str(r#"<div class="tools">"#);
@@ -76,11 +116,19 @@ fn profile_html(profile: &Snapshot) -> String {
             };
             let _ = write!(
                 html,
-                r#"<div class="tool-row"><span class="role">{}</span><b>{}</b><span class="mins">日均 {} 分钟 · {} 天</span>{trend}</div>"#,
+                r#"<div class="tool-row"><span class="role">{}</span><b>{}</b><span class="mins">{}</span>{trend}</div>"#,
                 esc(&tool.role),
                 esc(&tool.name),
-                tool.avg_min,
-                tool.days
+                fill(
+                    tr!(
+                        lang,
+                        "日均 {} 分钟 · {} 天",
+                        "{} min/day · {} days",
+                        "1 日平均 {} 分 · {} 日",
+                        "일평균 {}분 · {}일"
+                    ),
+                    &[&tool.avg_min, &tool.days]
+                ),
             );
         }
         html.push_str("</div>");
@@ -90,19 +138,45 @@ fn profile_html(profile: &Snapshot) -> String {
         for loop_ in &profile.loops {
             let _ = write!(
                 html,
-                r#"<li><b>{} ↔ {}</b><span>日均 {:.1} 次，其中一侧平均停留约 {} 秒</span></li>"#,
+                r#"<li><b>{} ↔ {}</b><span>{}</span></li>"#,
                 esc(&loop_.a),
                 esc(&loop_.b),
-                loop_.per_day,
-                loop_.dwell_secs()
+                fill(
+                    tr!(
+                        lang,
+                        "日均 {} 次，其中一侧平均停留约 {} 秒",
+                        "{} times/day, one side stays only about {} s",
+                        "1 日平均 {} 回、片側の平均滞在は約 {} 秒",
+                        "일평균 {}회, 한쪽 평균 체류 약 {}초"
+                    ),
+                    &[&format!("{:.1}", loop_.per_day), &loop_.dwell_secs()]
+                ),
             );
         }
         html.push_str("</ul>");
     }
     let rhythm = &profile.rhythm;
     let span = match (rhythm.start.is_empty(), rhythm.end.is_empty()) {
-        (false, false) => format!("常在 {}–{} 活跃", rhythm.start, rhythm.end),
-        (false, true) => format!("常在 {} 之后活跃", rhythm.start),
+        (false, false) => fill(
+            tr!(
+                lang,
+                "常在 {}–{} 活跃",
+                "Usually active {}–{}",
+                "{}〜{} によく活動",
+                "보통 {}–{} 활동"
+            ),
+            &[&rhythm.start, &rhythm.end],
+        ),
+        (false, true) => fill(
+            tr!(
+                lang,
+                "常在 {} 之后活跃",
+                "Usually active after {}",
+                "{} 以降によく活動",
+                "보통 {} 이후 활동"
+            ),
+            &[&rhythm.start],
+        ),
         _ => String::new(),
     };
     let mut facts = Vec::new();
@@ -110,10 +184,28 @@ fn profile_html(profile: &Snapshot) -> String {
         facts.push(span);
     }
     if !rhythm.focus_window.is_empty() {
-        facts.push(format!("产出集中在 {}", rhythm.focus_window));
+        facts.push(fill(
+            tr!(
+                lang,
+                "产出集中在 {}",
+                "Focus time concentrates in {}",
+                "集中作業は {} に集中",
+                "집중 작업은 {}에 집중"
+            ),
+            &[&rhythm.focus_window],
+        ));
     }
     if rhythm.weekend_share > 0 {
-        facts.push(format!("周末占 {}% 的活跃时间", rhythm.weekend_share));
+        facts.push(fill(
+            tr!(
+                lang,
+                "周末占 {}% 的活跃时间",
+                "Weekends are {}% of active time",
+                "週末が活動時間の {}%",
+                "주말이 활동 시간의 {}%"
+            ),
+            &[&rhythm.weekend_share],
+        ));
     }
     if !facts.is_empty() {
         let _ = write!(html, r#"<p class="rhythm">{}</p>"#, esc(&facts.join(" · ")));
@@ -123,23 +215,48 @@ fn profile_html(profile: &Snapshot) -> String {
         for theme in &profile.themes {
             let _ = write!(
                 html,
-                r#"<span class="chip">{}<small>{} 天 · {} 分钟</small></span>"#,
+                r#"<span class="chip">{}<small>{}</small></span>"#,
                 esc(&theme.label),
-                theme.days,
-                theme.total_min
+                fill(
+                    tr!(
+                        lang,
+                        "{} 天 · {} 分钟",
+                        "{} days · {} min",
+                        "{} 日 · {} 分",
+                        "{}일 · {}분"
+                    ),
+                    &[&theme.days, &theme.total_min]
+                ),
             );
         }
         html.push_str("</div>");
     }
     if !profile.sites.is_empty() {
-        html.push_str(r#"<p class="muted sites">常访问："#);
+        html.push_str(tr!(
+            lang,
+            r#"<p class="muted sites">常访问："#,
+            r#"<p class="muted sites">Frequently visited: "#,
+            r#"<p class="muted sites">よく訪問："#,
+            r#"<p class="muted sites">자주 방문: "#
+        ));
         html.push_str(
             &profile
                 .sites
                 .iter()
-                .map(|site| format!("{}（日均 {} 分钟）", esc(&site.site), site.per_day))
+                .map(|site| {
+                    fill(
+                        tr!(
+                            lang,
+                            "{}（日均 {} 分钟）",
+                            "{} ({} min/day)",
+                            "{}（1 日平均 {} 分）",
+                            "{} (일평균 {}분)"
+                        ),
+                        &[&esc(&site.site), &site.per_day],
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join("、"),
+                .join(pick(lang, ["、", ", ", "、", ", "])),
         );
         html.push_str("</p>");
     }
@@ -147,21 +264,33 @@ fn profile_html(profile: &Snapshot) -> String {
     html
 }
 
-fn upgrade_html(index: usize, upgrade: &Upgrade, report: &Report) -> String {
+fn upgrade_html(index: usize, upgrade: &Upgrade, report: &Report, lang: Lang) -> String {
+    use crate::tr;
     let mut html = format!(
-        r#"<article class="card"><header><span class="idx">{}</span><div><h3>{}</h3><div class="tags"><span class="tag">{}</span><span>投入 <b>{}</b></span><span>把握 <b>{}</b></span>{}</div></div></header>"#,
+        r#"<article class="card"><header><span class="idx">{}</span><div><h3>{}</h3><div class="tags"><span class="tag">{}</span><span>{} <b>{}</b></span><span>{} <b>{}</b></span>{}</div></div></header>"#,
         index + 1,
         esc(&upgrade.title),
-        esc(&upgrade.kind),
-        esc(&upgrade.effort),
-        esc(&upgrade.confidence),
+        esc(kind_label(lang, &upgrade.kind)),
+        tr!(lang, "投入", "Effort", "手間", "투자"),
+        esc(level_label(lang, &upgrade.effort)),
+        tr!(lang, "把握", "Confidence", "確信度", "확신도"),
+        esc(level_label(lang, &upgrade.confidence)),
         evidence_refs(&upgrade.evidence),
     );
     if !upgrade.habit.trim().is_empty() {
         let _ = write!(
             html,
-            r#"<p class="habit">接上你现在：{}</p>"#,
-            esc(&upgrade.habit)
+            r#"<p class="habit">{}</p>"#,
+            fill(
+                tr!(
+                    lang,
+                    "接上你现在：{}",
+                    "Builds on what you do now: {}",
+                    "今のやり方をそのまま活かす：{}",
+                    "지금 하는 방식에 이어 붙이기: {}"
+                ),
+                &[&esc(&upgrade.habit)]
+            )
         );
     }
     if !upgrade.problem.trim().is_empty() {
@@ -170,8 +299,11 @@ fn upgrade_html(index: usize, upgrade: &Upgrade, report: &Report) -> String {
     if !upgrade.alternative.trim().is_empty() {
         let _ = write!(
             html,
-            r#"<p class="alternative">替换：{}</p>"#,
-            esc(&upgrade.alternative)
+            r#"<p class="alternative">{}</p>"#,
+            fill(
+                tr!(lang, "替换：{}", "Replaces: {}", "置き換え：{}", "대체: {}"),
+                &[&esc(&upgrade.alternative)]
+            )
         );
     }
     html.push_str(r#"<ol class="steps">"#);
@@ -181,10 +313,20 @@ fn upgrade_html(index: usize, upgrade: &Upgrade, report: &Report) -> String {
     html.push_str("</ol>");
     let mut facts = String::new();
     if !upgrade.payoff.trim().is_empty() {
-        let _ = write!(facts, "<dt>预期</dt><dd>{}</dd>", esc(&upgrade.payoff));
+        let _ = write!(
+            facts,
+            "<dt>{}</dt><dd>{}</dd>",
+            tr!(lang, "预期", "Expected gain", "期待効果", "기대 효과"),
+            esc(&upgrade.payoff)
+        );
     }
     if !upgrade.risk.trim().is_empty() {
-        let _ = write!(facts, "<dt>风险</dt><dd>{}</dd>", esc(&upgrade.risk));
+        let _ = write!(
+            facts,
+            "<dt>{}</dt><dd>{}</dd>",
+            tr!(lang, "风险", "Risk", "リスク", "위험"),
+            esc(&upgrade.risk)
+        );
     }
     if !facts.is_empty() {
         let _ = write!(html, r#"<dl class="facts">{facts}</dl>"#);
@@ -194,15 +336,16 @@ fn upgrade_html(index: usize, upgrade: &Upgrade, report: &Report) -> String {
             continue;
         };
         for resource in &item.resources {
-            html.push_str(&resource_html(resource));
+            html.push_str(&resource_html(resource, lang));
         }
     }
-    html.push_str(&unverified_note(&upgrade.unverified_numbers, "数字 "));
+    html.push_str(&unverified_note(&upgrade.unverified_numbers, lang, false));
     html.push_str("</article>");
     html
 }
 
-fn resource_html(resource: &crate::recommendations::Resource) -> String {
+fn resource_html(resource: &crate::recommendations::Resource, lang: Lang) -> String {
+    use crate::tr;
     let name = match safe_url(&resource.url) {
         Some(url) => format!(
             r#"<a href="{url}" target="_blank" rel="noreferrer">{}</a>"#,
@@ -211,34 +354,79 @@ fn resource_html(resource: &crate::recommendations::Resource) -> String {
         None => esc(&resource.name),
     };
     format!(
-        r#"<div class="tool"><div class="tool-head">{name}<span>{}</span></div><p>{}</p><p class="muted">配置成本：{} · 注意：{}</p></div>"#,
+        r#"<div class="tool"><div class="tool-head">{name}<span>{}</span></div><p>{}</p><p class="muted">{}</p></div>"#,
         esc(&resource.kind),
         esc(&resource.description),
-        esc(&resource.setup_cost),
-        esc(&resource.permissions),
+        fill(
+            tr!(
+                lang,
+                "配置成本：{} · 注意：{}",
+                "Setup cost: {} · Watch out: {}",
+                "設定コスト：{} · 注意：{}",
+                "설정 비용: {} · 주의: {}"
+            ),
+            &[&esc(&resource.setup_cost), &esc(&resource.permissions)]
+        ),
     )
 }
 
-fn adoption_html(adoptions: &[AdoptionReview], followup: &str) -> String {
+fn adoption_html(adoptions: &[AdoptionReview], followup: &str, lang: Lang) -> String {
+    use crate::tr;
     if adoptions.is_empty() && followup.trim().is_empty() {
         return String::new();
     }
-    let mut html = String::from(r#"<section class="adoption"><h2>采纳回看</h2>"#);
+    let mut html = format!(
+        r#"<section class="adoption"><h2>{}</h2>"#,
+        tr!(
+            lang,
+            "采纳回看",
+            "Adoption review",
+            "採用の振り返り",
+            "채택 되돌아보기"
+        )
+    );
     for item in adoptions {
         let _ = write!(
             html,
-            r#"<div class="adoption-row"><b>{}</b><span class="muted">{} 起</span><p>{}</p><p class="muted">当时：{}</p>{}</div>"#,
+            r#"<div class="adoption-row"><b>{}</b><span class="muted">{}</span><p>{}</p><p class="muted">{}</p>{}</div>"#,
             esc(&item.resource),
-            esc(&item.date_key),
+            fill(
+                tr!(lang, "{} 起", "since {}", "{} から", "{}부터"),
+                &[&esc(&item.date_key)]
+            ),
             if item.after.is_some() {
-                "今天同类动作的观察结果"
+                tr!(
+                    lang,
+                    "今天同类动作的观察结果",
+                    "What the same move looks like today",
+                    "今日の同種の動きの観察結果",
+                    "오늘 같은 동작의 관찰 결과"
+                )
             } else {
-                "今天这类来回已经不再是候选"
+                tr!(
+                    lang,
+                    "今天这类来回已经不再是候选",
+                    "This kind of back-and-forth is no longer a candidate today",
+                    "今日はこの種の往復が候補から外れています",
+                    "오늘은 이런 왕복이 더 이상 후보가 아닙니다"
+                )
             },
-            esc(&item.before),
+            fill(
+                tr!(lang, "当时：{}", "Then: {}", "当時：{}", "당시: {}"),
+                &[&esc(&item.before)]
+            ),
             item.after
                 .as_ref()
-                .map(|after| format!("<p>现在：{}</p>", esc(after)))
+                .map(|after| fill(
+                    tr!(
+                        lang,
+                        "<p>现在：{}</p>",
+                        "<p>Now: {}</p>",
+                        "<p>現在：{}</p>",
+                        "<p>현재: {}</p>"
+                    ),
+                    &[&esc(after)]
+                ))
                 .unwrap_or_default()
         );
     }
@@ -250,7 +438,8 @@ fn adoption_html(adoptions: &[AdoptionReview], followup: &str) -> String {
 }
 
 /// Builds the full HTML page for a report.
-pub fn render(report: &Report) -> String {
+pub fn render(report: &Report, lang: Lang) -> String {
+    use crate::tr;
     let mut body = String::new();
     let generated = local_datetime(report.generated_at)
         .map(|date| date.format("%m-%d %H:%M").to_string())
@@ -263,10 +452,25 @@ pub fn render(report: &Report) -> String {
 
     let _ = write!(
         body,
-        r#"<header class="top"><p class="eyebrow">TraceBit · {} 工具升级建议</p><h1>{}</h1></header>"#,
-        esc(&report.date_key),
+        r#"<header class="top"><p class="eyebrow">{}</p><h1>{}</h1></header>"#,
+        fill(
+            tr!(
+                lang,
+                "TraceBit · {} 工具升级建议",
+                "TraceBit · {} tool upgrade advice",
+                "TraceBit · {} ツール改善の提案",
+                "TraceBit · {} 도구 개선 제안"
+            ),
+            &[&esc(&report.date_key)]
+        ),
         if headline.trim().is_empty() {
-            "工具升级建议".to_owned()
+            esc(tr!(
+                lang,
+                "工具升级建议",
+                "Tool upgrade advice",
+                "ツール改善の提案",
+                "도구 개선 제안"
+            ))
         } else {
             esc(&headline)
         },
@@ -290,9 +494,9 @@ pub fn render(report: &Report) -> String {
             let _ = write!(
                 body,
                 r#"<div class="metric"><span>{}</span><b>{}</b><small>{}</small></div>"#,
-                def.label,
+                def.label(lang),
                 num(value),
-                def.unit
+                def.unit(lang)
             );
         }
         body.push_str("</section>");
@@ -305,50 +509,87 @@ pub fn render(report: &Report) -> String {
             r#"<pre class="legacy">{}</pre>"#,
             esc(&report.markdown)
         );
-        return page(report, &body, &generated);
+        return page(report, &body, &generated, lang);
     };
 
     if let Some(profile) = &report.profile {
-        body.push_str(&profile_html(profile));
+        body.push_str(&profile_html(profile, lang));
     }
 
     if !advice.reading.is_empty() {
-        body.push_str(r#"<section><h2>你的工作方式</h2><ul class="findings">"#);
+        let _ = write!(
+            body,
+            r#"<section><h2>{}</h2><ul class="findings">"#,
+            tr!(
+                lang,
+                "你的工作方式",
+                "How you work",
+                "あなたの働き方",
+                "업무 방식"
+            )
+        );
         for item in &advice.reading {
             let _ = write!(
                 body,
                 "<li><p>{}</p>{}<span class=\"muted\">{}</span></li>",
                 esc(&item.observation),
                 evidence_refs(&item.evidence),
-                esc(&item.confidence)
+                esc(level_label(lang, &item.confidence))
             );
         }
         body.push_str("</ul>");
-        body.push_str(&unverified_note(
-            &advice.unverified_numbers,
-            "以上描述中的数字 ",
-        ));
+        body.push_str(&unverified_note(&advice.unverified_numbers, lang, true));
         body.push_str("</section>");
     }
 
-    body.push_str(&adoption_html(&report.adoptions, &advice.followup));
+    body.push_str(&adoption_html(&report.adoptions, &advice.followup, lang));
 
-    body.push_str(r#"<section><h2>工具升级机会</h2><div class="cards">"#);
+    let _ = write!(
+        body,
+        r#"<section><h2>{}</h2><div class="cards">"#,
+        tr!(
+            lang,
+            "工具升级机会",
+            "Tool upgrade opportunities",
+            "ツール改善の機会",
+            "도구 개선 기회"
+        )
+    );
     for (index, upgrade) in advice.upgrades.iter().enumerate() {
-        body.push_str(&upgrade_html(index, upgrade, report));
+        body.push_str(&upgrade_html(index, upgrade, report, lang));
     }
     body.push_str("</div></section>");
 
     if !advice.watch.is_empty() {
-        body.push_str(r#"<section class="watch"><h2>下次自动核对</h2><p class="muted">这些指标不需要你做任何事，下次生成时会自动对照。</p>"#);
+        let _ = write!(
+            body,
+            r#"<section class="watch"><h2>{}</h2><p class="muted">{}</p>"#,
+            tr!(
+                lang,
+                "下次自动核对",
+                "Checked automatically next time",
+                "次回の自動確認",
+                "다음 자동 확인"
+            ),
+            tr!(
+                lang,
+                "这些指标不需要你做任何事，下次生成时会自动对照。",
+                "These metrics need nothing from you; the next report compares them automatically.",
+                "これらの指標は特に操作は不要で、次回の生成時に自動で照合します。",
+                "이 지표는 따로 할 일이 없으며 다음 생성 시 자동으로 비교합니다."
+            )
+        );
         for item in &advice.watch {
             let (label, unit) = metric_def(&item.metric)
-                .map(|def| (def.label, def.unit))
-                .unwrap_or(("指标", ""));
+                .map(|def| (def.label(lang), def.unit(lang)))
+                .unwrap_or((tr!(lang, "指标", "Metric", "指標", "지표"), ""));
             let _ = write!(
                 body,
-                r#"<div class="watch-row"><b>{label}</b><span class="now">今天 {}{unit}</span><p>{}</p></div>"#,
-                num(item.baseline.unwrap_or_default()),
+                r#"<div class="watch-row"><b>{label}</b><span class="now">{}</span><p>{}</p></div>"#,
+                fill(
+                    tr!(lang, "今天 {}{}", "Today {} {}", "今日 {}{}", "오늘 {}{}"),
+                    &[&num(item.baseline.unwrap_or_default()), &unit]
+                ),
                 esc(&item.reason)
             );
         }
@@ -358,8 +599,17 @@ pub fn render(report: &Report) -> String {
     if !advice.filtered.is_empty() {
         let _ = write!(
             body,
-            r#"<p class="warn filtered">已过滤 {} 条要求改变习惯的内容；本报告只保留能让现有动作更省力的工具建议。</p>"#,
-            advice.filtered.len()
+            r#"<p class="warn filtered">{}</p>"#,
+            fill(
+                tr!(
+                    lang,
+                    "已过滤 {} 条要求改变习惯的内容；本报告只保留能让现有动作更省力的工具建议。",
+                    "Filtered out {} items that asked you to change habits; this report keeps only tool advice that makes existing actions easier.",
+                    "習慣の変更を求める内容を {} 件除外しました。このレポートは既存の動きを楽にするツール提案だけを残しています。",
+                    "습관 변경을 요구하는 내용 {}건을 걸러냈습니다. 이 보고서는 기존 동작을 더 쉽게 만드는 도구 제안만 남깁니다."
+                ),
+                &[&advice.filtered.len()]
+            )
         );
     }
 
@@ -374,23 +624,47 @@ pub fn render(report: &Report) -> String {
         .filter(|item| !used.contains(&item.id))
         .collect::<Vec<_>>();
     if !unused.is_empty() {
-        body.push_str("<section><h2>其他可评估的工具</h2>");
+        let _ = write!(
+            body,
+            "<section><h2>{}</h2>",
+            tr!(
+                lang,
+                "其他可评估的工具",
+                "Other tools worth a look",
+                "そのほか検討できるツール",
+                "그 밖에 검토할 도구"
+            )
+        );
         for item in unused {
             let _ = write!(
                 body,
-                r#"<div class="other"><h3>{}</h3><p class="muted">依据：{}</p>"#,
+                r#"<div class="other"><h3>{}</h3><p class="muted">{}</p>"#,
                 esc(&item.title),
-                esc(&item.evidence)
+                fill(
+                    tr!(lang, "依据：{}", "Evidence: {}", "根拠：{}", "근거: {}"),
+                    &[&esc(&item.evidence)]
+                )
             );
             if !item.replaces.is_empty() {
                 let _ = write!(
                     body,
-                    r#"<p class="muted">可替代：{}</p>"#,
-                    esc(&item.replaces.join("、"))
+                    r#"<p class="muted">{}</p>"#,
+                    fill(
+                        tr!(
+                            lang,
+                            "可替代：{}",
+                            "Can replace: {}",
+                            "代替できるもの：{}",
+                            "대체 가능: {}"
+                        ),
+                        &[&esc(&item
+                            .replaces
+                            .join(pick(lang, ["、", ", ", "、", ", "])))],
+                    )
                 );
             }
             for resource in &item.resources {
-                body.push_str(&resource_html(resource));
+                body.push_str(&resource_html(resource, lang));
             }
             body.push_str("</div>");
         }
@@ -400,8 +674,17 @@ pub fn render(report: &Report) -> String {
     if !report.evidence.is_empty() {
         let _ = write!(
             body,
-            r#"<section><details class="evidence" open><summary>依据 · {} 条</summary><dl>"#,
-            report.evidence.len()
+            r#"<section><details class="evidence" open><summary>{}</summary><dl>"#,
+            fill(
+                tr!(
+                    lang,
+                    "依据 · {} 条",
+                    "Evidence · {} items",
+                    "根拠 · {} 件",
+                    "근거 · {}건"
+                ),
+                &[&report.evidence.len()]
+            )
         );
         for item in &report.evidence {
             let _ = write!(
@@ -413,18 +696,34 @@ pub fn render(report: &Report) -> String {
         }
         body.push_str("</dl></details></section>");
     }
-    page(report, &body, &generated)
+    page(report, &body, &generated, lang)
 }
 
-fn page(report: &Report, body: &str, generated: &str) -> String {
+fn page(report: &Report, body: &str, generated: &str, lang: Lang) -> String {
+    use crate::tr;
     let mut meta = vec![
-        format!("模型 {}", esc(&report.model)),
+        fill(
+            tr!(lang, "模型 {}", "Model {}", "モデル {}", "모델 {}"),
+            &[&esc(&report.model)],
+        ),
         format!(
             "{} {generated}",
             if report.source == "auto" {
-                "自动生成"
+                tr!(
+                    lang,
+                    "自动生成",
+                    "generated automatically",
+                    "自動生成",
+                    "자동 생성"
+                )
             } else {
-                "手动生成"
+                tr!(
+                    lang,
+                    "手动生成",
+                    "generated manually",
+                    "手動生成",
+                    "수동 생성"
+                )
             }
         ),
     ];
@@ -438,20 +737,48 @@ fn page(report: &Report, body: &str, generated: &str) -> String {
         meta.push(esc(&report.prompt_version));
     }
     if report.resource_search.enabled {
-        meta.push(format!(
-            "联网检索 {} 次，验证 {} 个链接（搜索服务不会收到行为数据）",
-            report.resource_search.queries, report.resource_search.verified
+        meta.push(fill(
+            tr!(
+                lang,
+                "联网检索 {} 次，验证 {} 个链接（搜索服务不会收到行为数据）",
+                "{} web searches, {} links verified (the search service never receives activity data)",
+                "ウェブ検索 {} 回、リンク {} 件を検証（検索サービスに行動データは送信されません）",
+                "웹 검색 {}회, 링크 {}개 확인 (검색 서비스에 활동 데이터는 전송되지 않습니다)"
+            ),
+            &[&report.resource_search.queries, &report.resource_search.verified],
         ));
     }
+    let html_lang = match lang {
+        Lang::Zh => "zh-CN",
+        Lang::En => "en",
+        Lang::Ja => "ja",
+        Lang::Ko => "ko",
+    };
+    let title = fill(
+        tr!(
+            lang,
+            "{} 工具升级建议 · TraceBit",
+            "{} Tool upgrade advice · TraceBit",
+            "{} ツール改善の提案 · TraceBit",
+            "{} 도구 개선 제안 · TraceBit"
+        ),
+        &[&esc(&report.date_key)],
+    );
+    let footer = tr!(
+        lang,
+        "建议基于本地记录计算的证据；工具只供人工评估，TraceBit 不会自动下载、安装或启用。",
+        "Advice is based on evidence computed from your local records; tools are for you to evaluate yourself — TraceBit never downloads, installs, or enables anything.",
+        "提案はローカル記録から計算した根拠に基づきます。ツールはご自身で評価するためのもので、TraceBit が自動でダウンロード・インストール・有効化することはありません。",
+        "제안은 로컬 기록에서 계산한 근거에 기반합니다. 도구는 직접 검토하기 위한 것이며 TraceBit이 자동으로 내려받거나 설치하거나 켜지 않습니다."
+    );
     format!(
         r#"<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="{html_lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
-<title>{date} 工具升级建议 · TraceBit</title><style>{STYLE}</style></head>
+<title>{title}</title><style>{STYLE}</style></head>
 <body><main>{body}
-<footer><p>{meta}</p><p>建议基于本地记录计算的证据；工具只供人工评估，TraceBit 不会自动下载、安装或启用。</p></footer>
+<footer><p>{meta}</p><p>{footer}</p></footer>
 </main></body></html>"#,
-        date = esc(&report.date_key),
         meta = meta.join(" · "),
     )
 }
@@ -542,3 +869,44 @@ footer p+p{margin-top:4px}
 @media (max-width:640px){main{padding:32px 16px}.metrics{grid-template-columns:repeat(2,1fr)}.metric:nth-child(n){border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.metric:nth-child(2n){border-right:0}.habit,.problem,.alternative,.steps,.facts,.tool{margin-left:0}.tool-row{flex-wrap:wrap}.tool-row .role{flex-basis:100%}}
 @media print{body{background:#fff}.card,.adoption,.metrics{break-inside:avoid}}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Lang;
+
+    fn empty_report() -> Report {
+        serde_json::from_value(serde_json::json!({
+            "dateKey": "2026-11-20",
+            "markdown": "",
+            "model": "test-model",
+            "generatedAt": 0,
+            "activeMinutes": 30,
+            "switchCount": 3,
+            "appCount": 2,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn chrome_follows_the_language_and_keeps_the_document_lang() {
+        let report = empty_report();
+        let en = render(&report, Lang::En);
+        assert!(en.contains(r#"<html lang="en">"#));
+        assert!(en.contains("Tool upgrade advice"));
+        assert!(en.contains("Model test-model"));
+        assert!(!en.contains("工具升级"));
+
+        let ja = render(&report, Lang::Ja);
+        assert!(ja.contains(r#"<html lang="ja">"#));
+        assert!(ja.contains("ツール改善の提案"));
+
+        let ko = render(&report, Lang::Ko);
+        assert!(ko.contains(r#"<html lang="ko">"#));
+        assert!(ko.contains("도구 개선 제안"));
+
+        let zh = render(&report, Lang::Zh);
+        assert!(zh.contains(r#"<html lang="zh-CN">"#));
+        assert!(zh.contains("工具升级建议"));
+    }
+}

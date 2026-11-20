@@ -12,6 +12,27 @@ pub const CATEGORIES: [&str; 11] = [
     "其他",
 ];
 
+/// Display name for a canonical category id. Stored data and all matching logic
+/// stay Chinese; only the display layer goes through here. Unknown ids (for
+/// example a category written by a newer version) pass through unchanged.
+pub fn label(lang: crate::i18n::Lang, category: &str) -> &str {
+    use crate::tr;
+    match category {
+        "开发" => tr!(lang, "开发", "Development", "開発", "개발"),
+        "浏览器" => tr!(lang, "浏览器", "Browser", "ブラウザ", "브라우저"),
+        "即时通讯" => tr!(lang, "即时通讯", "Messaging", "メッセージ", "메신저"),
+        "办公文档" => tr!(lang, "办公文档", "Documents", "ドキュメント", "문서"),
+        "会议" => tr!(lang, "会议", "Meetings", "会議", "회의"),
+        "设计" => tr!(lang, "设计", "Design", "デザイン", "디자인"),
+        "资讯社交" => tr!(lang, "资讯社交", "News & social", "ソーシャル", "소셜"),
+        "娱乐" => tr!(lang, "娱乐", "Entertainment", "エンタメ", "엔터테인먼트"),
+        "工具" => tr!(lang, "工具", "Utilities", "ユーティリティ", "유틸리티"),
+        "系统" => tr!(lang, "系统", "System", "システム", "시스템"),
+        "其他" => tr!(lang, "其他", "Other", "その他", "기타"),
+        other => other,
+    }
+}
+
 /// Categories that represent producing work rather than consuming or coordinating.
 pub fn is_productive(category: &str) -> bool {
     matches!(category, "开发" | "办公文档" | "设计")
@@ -446,6 +467,25 @@ pub fn is_meeting(proc_name: &str, app_label: &str, title: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
+
+    #[test]
+    fn labels_localize_every_canonical_id() {
+        assert_eq!(label(Lang::En, "开发"), "Development");
+        assert_eq!(label(Lang::Ja, "即时通讯"), "メッセージ");
+        assert_eq!(label(Lang::Ko, "娱乐"), "엔터테인먼트");
+        for category in CATEGORIES {
+            assert_eq!(label(Lang::Zh, category), category);
+            assert!(!label(Lang::En, category).is_empty());
+            assert!(
+                !label(Lang::En, category)
+                    .chars()
+                    .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)),
+                "{category} has no English label"
+            );
+        }
+        assert_eq!(label(Lang::En, "custom"), "custom");
+    }
 
     #[test]
     fn process_and_fallback_categories_work() {
