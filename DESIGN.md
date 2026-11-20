@@ -1,7 +1,7 @@
 # TraceBit UI direction
 
 ## 1. Visual theme
-A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber trace as the brand anchor. Dense enough for daily utility, never a wall of interchangeable cards. Chinese UI copy states the data, state, or next action directly.
+A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber trace as the brand anchor. Dense enough for daily utility, never a wall of interchangeable cards. UI copy states the data, state, or next action directly, in the language chosen in Settings (Simplified Chinese, English, Japanese or Korean).
 
 ## 2. Color roles
 - Canvas: `#f3f5f6`
@@ -18,13 +18,13 @@ A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber
 - Category colors stay reserved for data, never decoration.
 
 ## 3. Typography
-- UI: `Segoe UI Variable`, `Microsoft YaHei UI`, `PingFang SC`, sans-serif
+- UI: `Segoe UI Variable`, `Microsoft YaHei UI`, `Yu Gothic UI`, `Malgun Gothic`, `PingFang SC`, sans-serif
 - Numbers: same UI family with tabular figures, not a separate terminal face
 - Page title: 24px / 650
 - Section title: 18px / 650
-- Body: 14px / 1.7 for Chinese
+- Body: 14px / 1.7 for CJK text
 - Caption: 12px / 1.5, never below 12px
-- No negative tracking on Chinese text.
+- No negative tracking on CJK text.
 
 ## 4. Components
 - One global recording control with an unambiguous verb: `开始记录` or `暂停记录`.

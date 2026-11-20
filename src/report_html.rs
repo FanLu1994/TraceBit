@@ -787,7 +787,7 @@ const STYLE: &str = r#"
 :root{--bg:#f4f1ea;--paper:#fffdf8;--ink:#1f2326;--sub:#5a6168;--faint:#8a9097;--line:#e3ddd0;--accent:#b7791f;--accent-pale:#f6ecd7;--green:#2f7d57;--red:#b64b4b;}
 @media (prefers-color-scheme:dark){:root{--bg:#17191b;--paper:#1f2225;--ink:#ecebe7;--sub:#b2b6ba;--faint:#80868c;--line:#33383c;--accent:#e0a54a;--accent-pale:#3a2f1c;--green:#5fb487;--red:#e07a7a;}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 "Segoe UI","Microsoft YaHei UI","PingFang SC",sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 "Segoe UI","Microsoft YaHei UI","Yu Gothic UI","Malgun Gothic","PingFang SC",sans-serif;-webkit-font-smoothing:antialiased}
 main{max-width:860px;margin:0 auto;padding:56px 28px 40px}
 .eyebrow{margin:0 0 10px;color:var(--accent);font-size:13px;font-weight:600;letter-spacing:.04em}
 h1{margin:0;font-size:30px;line-height:1.35;font-weight:700;letter-spacing:-.01em}
