@@ -1,5 +1,7 @@
 # TraceBit
 
+[简体中文](README.md) · [English](README.en.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+
 [![CI](https://github.com/FanLu1994/TraceBit/actions/workflows/ci.yml/badge.svg)](https://github.com/FanLu1994/TraceBit/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/FanLu1994/TraceBit)](https://github.com/FanLu1994/TraceBit/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -64,6 +66,7 @@ TraceBit 按活动段记录前台应用、窗口标题、空闲/锁屏状态和�
 ### 界面与统计
 
 - GPUI 原生界面：今日活动、24 小时时间线、分类占比、应用排行、快照回看
+- 界面语言：简体中文、English、日本語、한국어，默认跟随 Windows 显示语言，保存后立即生效
 - 最近统计：7 / 14 / 30 天总览，按天活跃曲线、活跃时段、常用应用与分类占比、常去网站和可点开的每日明细
 - 每日明细点击任意一行直接跳到那天的今日活动
 - 系统托盘、关闭到托盘、开机自启、容量轮换和一键清空
@@ -155,6 +158,7 @@ src/
   app.rs             # GPUI 窗口、四页 UI、托盘和后台任务
   input.rs           # 原生 GPUI 文本输入组件
   platform.rs        # Win32、UIA、窗口图标、自启动和通知
+  i18n.rs            # 简体中文 / English / 日本語 / 한국어 文本选择与语言检测
   recorder.rs        # 采集线程、截图去重和隐私规则
   store.rs           # JSONL 日存储与时间线/活动段/应用/网站/分类统计
   stats.rs           # 最近一段时间的周期统计聚合
