@@ -1,0 +1,52 @@
+name: 功能建议
+description: 提出新的统计、记录、报告或集成能力
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        建议先描述你现在的做法和卡点，再说期望的功能，这样更容易判断值不值得做。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 现在的做法和卡点
+      description: 你目前怎么完成这件事，哪一步最麻烦
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的功能
+      description: 你希望 TraceBit 怎么做，看到什么结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关模块
+      multiple: true
+      options:
+        - 今日活动 / 时间线
+        - 最近统计
+        - AI 建议 / 报告
+        - 采集与截图
+        - 浏览器网站记录
+        - 设置 / 托盘 / 自启动
+        - 数据导出 / 迁移
+        - 其他
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: 约束确认
+      options:
+        - label: 这个功能可以完全在本地完成，不需要新增外部服务
+        - label: 我理解数据格式需要保持向后兼容

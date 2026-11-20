@@ -1,0 +1,73 @@
+name: 问题反馈
+description: 报告崩溃、记录异常、界面问题或数据不一致
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请先搜索已有 issue，避免重复。
+
+        **请勿粘贴 API Key、窗口标题原文或截图中的隐私内容。**
+
+  - type: input
+    id: version
+    attributes:
+      label: TraceBit 版本
+      description: 设置页底部或安装包文件名，例如 0.6.0
+      placeholder: 0.6.0
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 在「设置 → 系统 → 关于」中查看
+      placeholder: Windows 11 23H2 (22631)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 发生了什么，界面或数据上看到的结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开「最近统计」
+        2. 切换到 30 天
+        3. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关模块
+      multiple: true
+      options:
+        - 今日活动 / 时间线
+        - 最近统计
+        - AI 建议 / 报告
+        - 采集与截图
+        - 浏览器网站记录
+        - 设置 / 托盘 / 自启动
+        - 安装包 / 更新
+        - 其他
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: 相关日志、`reports/` 片段或截图（请先脱敏）

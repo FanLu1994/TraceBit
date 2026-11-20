@@ -4,6 +4,11 @@ version = "0.6.0"
 edition = "2024"
 description = "Windows 本地行为记录与 AI 效率建议"
 license = "MIT"
+repository = "https://github.com/FanLu1994/TraceBit"
+readme = "README.md"
+rust-version = "1.85"
+keywords = ["activity-tracking", "gpui", "windows", "productivity", "local-first"]
+categories = ["gui", "os::windows-apis"]
 default-run = "tracebit"
 
 [dependencies]

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用前先读 README
+    url: https://github.com/FanLu1994/TraceBit#readme
+    about: 安装、AI 配置、数据位置和隐私说明都在这里。
+  - name: 下载最新版
+    url: https://github.com/FanLu1994/TraceBit/releases/latest
+    about: 覆盖安装即可，记录会保留。
