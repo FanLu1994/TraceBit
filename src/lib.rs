@@ -14,6 +14,7 @@ pub mod redact;
 pub mod report_html;
 pub mod secret;
 pub mod settings;
+pub mod stats;
 pub mod store;
 pub mod web_search;
 

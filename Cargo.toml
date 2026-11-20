@@ -1,6 +1,6 @@
 [package]
 name = "tracebit"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Windows 本地行为记录与 AI 效率建议"
 license = "MIT"

@@ -2,7 +2,7 @@
 SetCompressor /SOLID lzma
 
 !define APP_NAME "TraceBit"
-!define APP_VERSION "0.5.0"
+!define APP_VERSION "0.6.0"
 !define APP_EXE "tracebit.exe"
 !define APP_ID "TraceBit.Desktop"
 

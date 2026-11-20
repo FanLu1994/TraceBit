@@ -6,6 +6,7 @@ use crate::{
     profile::DecisionKind,
     recorder::{Recorder, RecorderStatus},
     settings::{Settings, SettingsData},
+    stats::{self, DayPoint},
     store::{DayStats, DayStore, DeriveOptions, hhmm, local_date_key, now_ms},
 };
 use anyhow::Result;
@@ -48,6 +49,7 @@ actions!(
     tracebit,
     [
         ShowToday,
+        ShowStats,
         ShowReport,
         ShowSettings,
         ToggleRecording,
@@ -61,6 +63,7 @@ actions!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Today,
+    Stats,
     Report,
     Settings,
 }
@@ -230,6 +233,11 @@ pub struct TraceBitWindow {
     view: View,
     date: NaiveDate,
     day: DayStats,
+    /// Day window of the statistics page and its cached roll-up.
+    stats_days: u32,
+    stats: stats::PeriodStats,
+    stats_key: Option<(String, u32)>,
+    stats_at: Option<std::time::Instant>,
     report: Option<Report>,
     report_list: Vec<ReportSummary>,
     /// Tool decisions, mirrored from the profile so the buttons show state.
@@ -302,6 +310,10 @@ impl TraceBitWindow {
             view: View::Today,
             date,
             day,
+            stats_days: 7,
+            stats: stats::PeriodStats::default(),
+            stats_key: None,
+            stats_at: None,
             report,
             report_list,
             decisions,
@@ -543,9 +555,35 @@ impl TraceBitWindow {
         }
     }
 
+    fn ensure_stats(&mut self) {
+        let today = Local::now().date_naive();
+        let key = (today.format("%Y-%m-%d").to_string(), self.stats_days);
+        let stale = self
+            .stats_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        if self.stats_key.as_ref() == Some(&key) && !stale {
+            return;
+        }
+        let recording = self.settings.get().recording;
+        self.stats = stats::load(
+            &self.store,
+            DeriveOptions::from_settings(&recording),
+            today,
+            self.stats_days,
+        );
+        self.stats_key = Some(key);
+        self.stats_at = Some(std::time::Instant::now());
+    }
+
     fn open_today(&mut self, _: &ShowToday, _: &mut Window, cx: &mut Context<Self>) {
         self.view = View::Today;
         self.reload_selected();
+        cx.notify();
+    }
+
+    fn open_stats(&mut self, _: &ShowStats, _: &mut Window, cx: &mut Context<Self>) {
+        self.view = View::Stats;
+        self.ensure_stats();
         cx.notify();
     }
 
@@ -776,6 +814,15 @@ impl TraceBitWindow {
                             cx.listener(|this, _, _, cx| {
                                 this.view = View::Today;
                                 this.reload_selected();
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        nav_button("nav-stats", "最近统计", self.view == View::Stats).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.view = View::Stats;
+                                this.ensure_stats();
                                 cx.notify();
                             }),
                         ),
@@ -1492,6 +1539,602 @@ impl TraceBitWindow {
                             )
                     }))
             })
+    }
+
+    fn render_stats(&mut self, cx: &mut Context<Self>) -> Div {
+        self.ensure_stats();
+        let page = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w(px(0.))
+            .gap_5()
+            .child(self.render_stats_head(cx));
+        if self.stats.active_days == 0 {
+            return page.child(
+                panel()
+                    .items_center()
+                    .gap_3()
+                    .py_10()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("这段时间还没有活动记录"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(SECONDARY))
+                            .child("记录开启后，这里会按天汇总活跃时长、常用工具和活跃时段。"),
+                    )
+                    .child(button("stats-empty-today", "查看今日活动", true).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.view = View::Today;
+                            this.date = Local::now().date_naive();
+                            this.reload_selected();
+                            cx.notify();
+                        }),
+                    )),
+            );
+        }
+        page.child(self.render_stats_metrics())
+            .child(self.render_stats_daily())
+            .child(self.render_stats_hours())
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w(px(0.))
+                    .gap_5()
+                    .items_start()
+                    .child(self.render_stats_apps().flex_1().min_w(px(0.)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_5()
+                            .w(px(320.))
+                            .child(self.render_stats_categories()),
+                    ),
+            )
+            .children((!self.stats.sites.is_empty()).then(|| self.render_stats_sites()))
+            .child(self.render_stats_days(cx))
+    }
+
+    fn render_stats_head(&mut self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_wrap()
+            .items_start()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("最近统计"),
+                    )
+                    .child(div().text_sm().text_color(rgb(SECONDARY)).child(format!(
+                        "最近 {} 天 · {} 至 {}",
+                        self.stats_days,
+                        month_day(&self.stats.start_key),
+                        month_day(&self.stats.end_key)
+                    ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children([7u32, 14, 30].map(|days| {
+                        small_button(
+                            SharedString::from(format!("stats-period-{days}")),
+                            &format!("{days} 天"),
+                            self.stats_days == days,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.stats_days = days;
+                            this.stats_key = None;
+                            this.ensure_stats();
+                            cx.notify();
+                        }))
+                    })),
+            )
+    }
+
+    fn render_stats_metrics(&self) -> Div {
+        let stats = &self.stats;
+        let longest_ms = stats
+            .longest_block
+            .as_ref()
+            .map(|(_, ms)| fmt_ms(*ms))
+            .unwrap_or_else(|| "暂无".to_owned());
+        let longest_app = stats
+            .longest_block
+            .as_ref()
+            .map(|(app, _)| app.clone())
+            .unwrap_or_else(|| "不足 1 分钟".to_owned());
+        let best_note = stats
+            .best_day
+            .as_ref()
+            .map(|(date_key, _)| format!("最活跃 {}", month_day(date_key)))
+            .unwrap_or_else(|| "按有记录的天数计".to_owned());
+        div()
+            .flex()
+            .w_full()
+            .py_4()
+            .border_b_1()
+            .border_color(rgb(DIVIDER))
+            .child(metric(
+                "总活跃",
+                &fmt_ms(stats.total_active_ms),
+                &format!("{} 天有记录", stats.active_days),
+            ))
+            .child(metric("日均活跃", &fmt_ms(stats.avg_daily_ms), &best_note))
+            .child(metric(
+                "应用切换",
+                &stats.total_switches.to_string(),
+                &format!("{:.1} 次/小时", stats.switches_per_hour),
+            ))
+            .child(metric("最长专注", &longest_ms, &longest_app))
+            .child(metric(
+                "本地快照",
+                &stats.screenshots.to_string(),
+                &fmt_bytes(stats.snapshot_bytes),
+            ))
+    }
+
+    fn render_stats_daily(&self) -> Div {
+        let stats = &self.stats;
+        let max = stats
+            .daily
+            .iter()
+            .map(|day| day.active_ms)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let step = stats.daily.len().div_ceil(8).max(1);
+        let total = stats.daily.len();
+        section()
+            .gap_3()
+            .child(panel_head("每日活跃", &format!("单日最高 {}", fmt_ms(max))))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_1()
+                    .h(px(136.))
+                    .w_full()
+                    .children(stats.daily.iter().map(|day: &DayPoint| {
+                        let fraction = day.active_ms as f32 / max as f32;
+                        let height =
+                            (fraction * 120.0).max(if day.active_ms > 0 { 3.0 } else { 2.0 });
+                        let color = if day.active_ms > 0 {
+                            category_color(&day.category)
+                        } else {
+                            SUBTLE
+                        };
+                        let tooltip = if day.active_ms > 0 {
+                            format!(
+                                "{} {} · {} · {} 次切换 · {}",
+                                month_day(&day.date_key),
+                                weekday_name(day.weekday),
+                                fmt_ms(day.active_ms),
+                                day.switches,
+                                day.top_app
+                            )
+                        } else {
+                            format!(
+                                "{} {} · 无记录",
+                                month_day(&day.date_key),
+                                weekday_name(day.weekday)
+                            )
+                        };
+                        div()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .h_full()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("stats-bar-{}", day.date_key)))
+                                    .w_full()
+                                    .h(px(height))
+                                    .rounded_sm()
+                                    .bg(rgb(color))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TextTooltip(tooltip.clone())).into()
+                                    }),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .w_full()
+                    .children(stats.daily.iter().enumerate().map(|(index, day)| {
+                        let show = index + 1 == total || index % step == 0;
+                        let label = if show {
+                            NaiveDate::parse_from_str(&day.date_key, "%Y-%m-%d")
+                                .map(|date| format!("{}日", date.day()))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(10.))
+                            .text_color(rgb(FAINT))
+                            .text_center()
+                            .child(label)
+                    })),
+            )
+    }
+
+    fn render_stats_hours(&self) -> Div {
+        let stats = &self.stats;
+        let max = stats.hourly.iter().copied().max().unwrap_or(0).max(1);
+        section()
+            .gap_3()
+            .child(panel_head("活跃时段", "所有记录日累计，按本机时间"))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_1()
+                    .h(px(96.))
+                    .w_full()
+                    .children((0..24).map(|hour| {
+                        let ms = stats.hourly[hour];
+                        let fraction = ms as f32 / max as f32;
+                        let height = (fraction * 80.0).max(if ms > 0 { 2.0 } else { 1.0 });
+                        let tooltip = format!("{hour}:00–{}:00 · {}", hour + 1, fmt_ms(ms));
+                        div()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .h_full()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("stats-hour-{hour}")))
+                                    .w_full()
+                                    .h(px(height))
+                                    .rounded_sm()
+                                    .bg(rgb(if ms > 0 { ACCENT } else { SUBTLE }))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| TextTooltip(tooltip.clone())).into()
+                                    }),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(10.))
+                    .text_color(rgb(FAINT))
+                    .child("0时")
+                    .child("6时")
+                    .child("12时")
+                    .child("18时")
+                    .child("23时"),
+            )
+    }
+
+    fn render_stats_apps(&self) -> Div {
+        let stats = &self.stats;
+        let max_ms = stats.apps.first().map(|app| app.ms).unwrap_or(1).max(1);
+        section()
+            .gap_3()
+            .child(panel_head("应用使用", "按周期内活跃时长排序"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .children(stats.apps.iter().take(12).map(|app| {
+                        let width = app.ms as f32 / max_ms as f32;
+                        let color = category_color(&app.category);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(DIVIDER))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_sm()
+                                            .child(app.app.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .text_xs()
+                                            .text_color(rgb(color))
+                                            .child(app.category.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(76.))
+                                            .text_right()
+                                            .text_sm()
+                                            .child(fmt_ms(app.ms)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(44.))
+                                            .text_right()
+                                            .text_xs()
+                                            .text_color(rgb(SECONDARY))
+                                            .child(format!("{} 天", app.days)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(3.))
+                                    .w_full()
+                                    .bg(rgb(SUBTLE))
+                                    .rounded_full()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(width))
+                                            .rounded_full()
+                                            .bg(rgb(color)),
+                                    ),
+                            )
+                    })),
+            )
+    }
+
+    fn render_stats_categories(&self) -> Div {
+        let stats = &self.stats;
+        let total = stats.total_active_ms.max(1);
+        section()
+            .gap_3()
+            .child(panel_head("分类占比", "按活跃时长"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(stats.categories.iter().take(8).map(|category| {
+                        let share = category.ms as f32 / total as f32;
+                        let color = category_color(&category.name);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(div().text_sm().child(category.name.clone()))
+                                    .child(div().text_xs().text_color(rgb(SECONDARY)).child(
+                                        format!("{} · {:.0}%", fmt_ms(category.ms), share * 100.0),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .h(px(4.))
+                                    .w_full()
+                                    .bg(rgb(SUBTLE))
+                                    .rounded_full()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(share))
+                                            .rounded_full()
+                                            .bg(rgb(color)),
+                                    ),
+                            )
+                    })),
+            )
+    }
+
+    fn render_stats_sites(&self) -> Div {
+        let max_ms = self
+            .stats
+            .sites
+            .first()
+            .map(|site| site.ms)
+            .unwrap_or(1)
+            .max(1);
+        section()
+            .gap_3()
+            .child(panel_head("常去网站", "按浏览器停留时长排序"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .children(self.stats.sites.iter().take(8).map(|site| {
+                        let width = site.ms as f32 / max_ms as f32;
+                        let color = site
+                            .category
+                            .as_deref()
+                            .map(category_color)
+                            .unwrap_or(0x3f897d);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(DIVIDER))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_sm()
+                                            .child(site.site.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(80.))
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(rgb(SECONDARY))
+                                            .child(site.app.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(44.))
+                                            .text_right()
+                                            .text_xs()
+                                            .text_color(rgb(SECONDARY))
+                                            .child(format!("{} 次", site.visits)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(76.))
+                                            .text_right()
+                                            .text_sm()
+                                            .child(fmt_ms(site.ms)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(3.))
+                                    .w_full()
+                                    .bg(rgb(SUBTLE))
+                                    .rounded_full()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(width))
+                                            .rounded_full()
+                                            .bg(rgb(color)),
+                                    ),
+                            )
+                    })),
+            )
+    }
+
+    fn render_stats_days(&self, cx: &mut Context<Self>) -> Div {
+        section()
+            .gap_3()
+            .child(panel_head("每日明细", "点一行查看当天活动"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
+                    .text_xs()
+                    .text_color(rgb(FAINT))
+                    .child(div().w(px(132.)).child("日期"))
+                    .child(div().flex_1().min_w(px(0.)).child("主要应用"))
+                    .child(div().w(px(80.)).text_right().child("活跃时长"))
+                    .child(div().w(px(64.)).text_right().child("切换"))
+                    .child(div().w(px(80.)).text_right().child("主要分类")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .children(self.stats.daily.iter().rev().map(|day| {
+                        let date = NaiveDate::parse_from_str(&day.date_key, "%Y-%m-%d").ok();
+                        let active = day.active_ms > 0;
+                        let color = category_color(&day.category);
+                        div()
+                            .id(SharedString::from(format!("stats-day-{}", day.date_key)))
+                            .tab_index(0)
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(DIVIDER))
+                            .when(active, |row| {
+                                row.cursor_pointer()
+                                    .hover(|style| style.bg(rgb(CANVAS)))
+                                    .focus(|style| style.border_color(rgb(ACCENT)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(date) = date {
+                                            this.view = View::Today;
+                                            this.date = date;
+                                            this.reload_selected();
+                                            cx.notify();
+                                        }
+                                    }))
+                            })
+                            .child(
+                                div()
+                                    .w(px(132.))
+                                    .text_sm()
+                                    .text_color(rgb(if active { INK } else { FAINT }))
+                                    .child(format!(
+                                        "{} · {}",
+                                        month_day(&day.date_key),
+                                        weekday_name(day.weekday)
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(rgb(SECONDARY))
+                                    .child(if active {
+                                        day.top_app.clone()
+                                    } else {
+                                        "无记录".to_owned()
+                                    }),
+                            )
+                            .child(div().w(px(80.)).text_right().text_sm().child(if active {
+                                fmt_ms(day.active_ms)
+                            } else {
+                                "—".to_owned()
+                            }))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_right()
+                                    .text_sm()
+                                    .text_color(rgb(SECONDARY))
+                                    .child(day.switches.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(80.))
+                                    .text_right()
+                                    .text_xs()
+                                    .text_color(rgb(color))
+                                    .child(day.category.clone()),
+                            )
+                    })),
+            )
     }
 
     fn render_report(&mut self, cx: &mut Context<Self>) -> Div {
@@ -2368,6 +3011,7 @@ impl Render for TraceBitWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.view {
             View::Today => self.render_today(cx),
+            View::Stats => self.render_stats(cx),
             View::Report => self.render_report(cx),
             View::Settings => self.render_settings(cx),
         };
@@ -2375,6 +3019,7 @@ impl Render for TraceBitWindow {
             .relative()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_today))
+            .on_action(cx.listener(Self::open_stats))
             .on_action(cx.listener(Self::open_report))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_recording_from_key))
@@ -2629,6 +3274,16 @@ fn fmt_ms(ms: i64) -> String {
     }
 }
 
+fn weekday_name(index: u32) -> &'static str {
+    ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][(index % 7) as usize]
+}
+
+fn month_day(date_key: &str) -> String {
+    NaiveDate::parse_from_str(date_key, "%Y-%m-%d")
+        .map(|date| format!("{}月{}日", date.month(), date.day()))
+        .unwrap_or_else(|_| date_key.to_owned())
+}
+
 fn fmt_bytes(bytes: u64) -> String {
     if bytes < 1024_u64.pow(3) {
         format!("{:.1} MB", bytes as f64 / 1024_f64.powi(2))
@@ -2709,6 +3364,7 @@ pub fn run() -> Result<()> {
         input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-1", ShowToday, None),
+            KeyBinding::new("ctrl-4", ShowStats, None),
             KeyBinding::new("ctrl-2", ShowReport, None),
             KeyBinding::new("ctrl-3", ShowSettings, None),
             KeyBinding::new("ctrl-,", ShowSettings, None),

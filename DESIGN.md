@@ -62,7 +62,7 @@ A light, neutral workbench for reviewing a day: gray canvas, dark ink, one amber
 - Use the arrow cursor on buttons, navigation, list rows, and thumbnails. Reserve the hand cursor for content links and the I-beam for editable text.
 - Tab / Shift-Tab moves through controls; Enter / Space activates the focused control. Focus uses a visible amber outline without changing layout.
 - Escape closes the snapshot viewer or dismisses inline feedback.
-- Shortcuts: Ctrl+1 Today, Ctrl+2 Report, Ctrl+3 or Ctrl+, Settings, Ctrl+Shift+R toggle recording, Ctrl+W close window.
+- Shortcuts: Ctrl+1 Today, Ctrl+4 Recent stats, Ctrl+2 Report, Ctrl+3 or Ctrl+, Settings, Ctrl+Shift+R toggle recording, Ctrl+W close window.
 - A second launch restores and focuses the existing window.
 - The snapshot viewer has a header, a viewport-bounded image area, and a footer toolbar. It must not overflow at the minimum window size.
 
