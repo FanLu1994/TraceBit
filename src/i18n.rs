@@ -82,15 +82,18 @@ impl Lang {
         Self::from_code(setting).unwrap_or_else(Self::detect)
     }
 
-    /// Windows UI language first, then the POSIX locale, then Chinese.
+    /// Windows UI language first, then the POSIX locale. Unsupported Windows
+    /// display languages fall back to English; only a machine with no language
+    /// signal at all keeps the historical Chinese default.
     pub fn detect() -> Self {
         if let Ok(value) = std::env::var("TRACEBIT_LANG")
             && let Some(lang) = Self::from_code(&value)
         {
             return lang;
         }
-        if let Some(lang) = Self::from_langid(windows_ui_language()) {
-            return lang;
+        let ui = windows_ui_language();
+        if ui != 0 {
+            return Self::from_langid(ui).unwrap_or(Self::En);
         }
         for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
             if let Ok(value) = std::env::var(key)
