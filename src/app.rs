@@ -4203,9 +4203,9 @@ impl TraceBitWindow {
                 tr!(
                     lang,
                     "用逗号分隔。前台应用、标题或网站命中时，标题写为“[敏感窗口]”，且不截图、不记录网站",
-                    "Comma-separated. When an app, title or site matches, the title becomes “[敏感窗口]”, and no screenshot or site is recorded.",
-                    "カンマ区切り。前面のアプリ・タイトル・サイトが一致すると、タイトルは「[敏感窗口]」になり、撮影もサイト記録も行いません。",
-                    "쉼표로 구분합니다. 전면 앱, 제목, 사이트가 일치하면 제목이 “[敏感窗口]”으로 저장되고 스냅샷과 사이트는 기록하지 않습니다."
+                    "Comma-separated. When an app, title or site matches, the title becomes “[Sensitive window]”, and no screenshot or site is recorded.",
+                    "カンマ区切り。前面のアプリ・タイトル・サイトが一致すると、タイトルは「[機密ウィンドウ]」になり、撮影もサイト記録も行いません。",
+                    "쉼표로 구분합니다. 전면 앱, 제목, 사이트가 일치하면 제목이 “[민감한 창]”으로 저장되고 스냅샷과 사이트는 기록하지 않습니다."
                 ),
                 self.form.patterns.clone(),
             ))
